@@ -3,6 +3,8 @@ services:
     build: .
     container_name: tg-net-tools-bot
     restart: unless-stopped
+    # The bot may use a Telegram proxy bound to 127.0.0.1 on the Raspberry Pi host.
+    network_mode: host
     command: ["serve"]
     env_file: .env
     environment:
