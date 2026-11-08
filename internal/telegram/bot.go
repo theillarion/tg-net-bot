@@ -81,6 +81,7 @@ func NewBot(api *API, service *monitor.Service, allowed map[int64]struct{}, logg
 
 func (b *Bot) Run(ctx context.Context) error {
 	offset := 0
+	connected := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -91,6 +92,7 @@ func (b *Bot) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			connected = false
 			b.logger.Error("Telegram polling failed", "error", err)
 			select {
 			case <-ctx.Done():
@@ -98,6 +100,10 @@ func (b *Bot) Run(ctx context.Context) error {
 			case <-time.After(3 * time.Second):
 				continue
 			}
+		}
+		if !connected {
+			b.logger.Info("Telegram polling connected")
+			connected = true
 		}
 		for _, update := range updates {
 			offset = update.UpdateID + 1

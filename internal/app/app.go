@@ -51,6 +51,9 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open fun
 	if err != nil {
 		return fmt.Errorf("initialize monitor: %w", err)
 	}
+	if logger != nil {
+		logger.Info("application started", "database_path", cfg.DatabasePath)
+	}
 	go service.Run(ctx)
 	if err = runBot(ctx, api, service, cfg.AllowedUsers, logger); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("run Telegram bot: %w", err)

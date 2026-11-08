@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"github.com/theillarion/tg-net-bot/internal/config"
@@ -18,11 +19,16 @@ import (
 
 func TestServeCanceled(t *testing.T) {
 	cfg := config.Config{DatabasePath: filepath.Join(t.TempDir(), "state.db"), Token: "test", AllowedUsers: map[int64]struct{}{1: {}}}
-	err := serve(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), func(ctx context.Context, path string) (appState, error) { return storage.Open(ctx, path) }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	err := serve(context.Background(), cfg, logger, func(ctx context.Context, path string) (appState, error) { return storage.Open(ctx, path) }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
 		return context.Canceled
 	})
 	if err != nil {
 		t.Fatalf("Serve with graceful cancellation: %v", err)
+	}
+	if !strings.Contains(logs.String(), "application started") {
+		t.Fatalf("startup was not logged: %s", logs.String())
 	}
 }
 func TestServeInvalidProxy(t *testing.T) {

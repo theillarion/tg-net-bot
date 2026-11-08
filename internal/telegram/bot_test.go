@@ -3,6 +3,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -205,6 +206,7 @@ func TestBotHelpersAndRunCancellation(t *testing.T) {
 
 func TestBotRunPollingAndFailure(t *testing.T) {
 	var mu sync.Mutex
+	var logs bytes.Buffer
 	messages := 0
 	var cancel context.CancelFunc
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -226,9 +228,12 @@ func TestBotRunPollingAndFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bot := NewBot(api, svc, map[int64]struct{}{1: {}}, nil)
+	bot := NewBot(api, svc, map[int64]struct{}{1: {}}, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err = bot.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error=%v", err)
+	}
+	if !strings.Contains(logs.String(), "Telegram polling connected") {
+		t.Fatalf("successful Telegram polling was not logged: %s", logs.String())
 	}
 	mu.Lock()
 	got := messages
