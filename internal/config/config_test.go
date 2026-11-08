@@ -54,6 +54,11 @@ func TestLoadBlockCheckCacheTTL(t *testing.T) {
 	if err != nil || got.BlockCheckCacheTTL != 45*time.Minute {
 		t.Fatalf("ttl=%s err=%v", got.BlockCheckCacheTTL, err)
 	}
+	t.Setenv("BLOCKCHECK_CACHE_TTL", "")
+	got, err = Load()
+	if err != nil || got.BlockCheckCacheTTL != 24*time.Hour {
+		t.Fatalf("default ttl=%s err=%v", got.BlockCheckCacheTTL, err)
+	}
 	t.Setenv("BLOCKCHECK_CACHE_TTL", "0")
 	if _, err := Load(); err == nil {
 		t.Fatal("non-positive cache ttl accepted")
@@ -82,6 +87,12 @@ func TestLoadBlockCheckSettings(t *testing.T) {
 		if err := validateRedisAddress(address); err != nil {
 			t.Errorf("valid Redis address %q rejected: %v", address, err)
 		}
+	}
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("BLOCKCHECK_CACHE_TTL", "")
+	_, _, ttl, err = LoadBlockCheckSettings()
+	if err != nil || ttl != 24*time.Hour {
+		t.Fatalf("default Redis cache ttl=%s err=%v", ttl, err)
 	}
 	for _, address := range []string{"redis://cache.internal:nope", "cache.internal:70000", ":6379"} {
 		if err := validateRedisAddress(address); err == nil {

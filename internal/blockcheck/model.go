@@ -21,6 +21,13 @@ type RateLimitError struct {
 	RetryAfter time.Duration `json:"retry_after,omitempty"`
 }
 
+// CacheWriteError indicates that the primary result succeeded but its probe
+// context could not be persisted for a later explicit probe.
+type CacheWriteError struct{ Err error }
+
+func (e *CacheWriteError) Error() string { return "cache extended check context: " + e.Err.Error() }
+func (e *CacheWriteError) Unwrap() error { return e.Err }
+
 func (e *RateLimitError) Error() string {
 	if e.RetryAfter > 0 {
 		return e.Provider + " rate limit reached for " + e.Route + "; retry after " + e.RetryAfter.String()
@@ -30,23 +37,24 @@ func (e *RateLimitError) Error() string {
 
 // Result preserves all fields returned by the primary check endpoint.
 type Result struct {
-	ID             string                       `json:"id,omitempty"`
-	CacheKey       string                       `json:"cache_key,omitempty"`
-	Target         string                       `json:"target"`
-	TargetType     string                       `json:"target_type"`
-	Blocked        bool                         `json:"blocked"`
-	RKNDomain      *string                      `json:"rkn_domain,omitempty"`
-	IPs            []string                     `json:"ips"`
-	BlockedSubnets []string                     `json:"blocked_subnets"`
-	CDNProviders   map[string][]json.RawMessage `json:"cdn_providers"`
-	Geo            json.RawMessage              `json:"geo"`
-	ASNInfo        json.RawMessage              `json:"asn_info,omitempty"`
-	Whitelist      json.RawMessage              `json:"whitelist,omitempty"`
-	SubnetSize     *string                      `json:"subnet_size,omitempty"`
-	ReverseLookup  []string                     `json:"reverse_lookup"`
-	Complaints     []json.RawMessage            `json:"complaints"`
-	ProbeAvailable bool                         `json:"probe_available"`
-	CheckedAt      time.Time                    `json:"checked_at"`
+	ID                string                       `json:"id,omitempty"`
+	CacheKey          string                       `json:"cache_key,omitempty"`
+	Target            string                       `json:"target"`
+	TargetType        string                       `json:"target_type"`
+	Blocked           bool                         `json:"blocked"`
+	RKNDomain         *string                      `json:"rkn_domain,omitempty"`
+	IPs               []string                     `json:"ips"`
+	BlockedSubnets    []string                     `json:"blocked_subnets"`
+	CDNProviders      map[string][]json.RawMessage `json:"cdn_providers"`
+	Geo               json.RawMessage              `json:"geo"`
+	ASNInfo           json.RawMessage              `json:"asn_info,omitempty"`
+	Whitelist         json.RawMessage              `json:"whitelist,omitempty"`
+	SubnetSize        *string                      `json:"subnet_size,omitempty"`
+	ReverseLookup     []string                     `json:"reverse_lookup"`
+	Complaints        []json.RawMessage            `json:"complaints"`
+	ProbeAvailable    bool                         `json:"probe_available"`
+	CheckedAt         time.Time                    `json:"checked_at"`
+	UpstreamExpiresAt *time.Time                   `json:"upstream_expires_at,omitempty"`
 }
 
 type ProbeStats struct {

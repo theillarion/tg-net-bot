@@ -2,6 +2,7 @@ package cheburcheck
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +44,53 @@ func TestCheckMakesOnlyPrimaryRequestAndPreservesResponse(t *testing.T) {
 		t.Fatalf("response fields not preserved: %+v", result)
 	}
 }
+
+func TestCheckExtractsJWTExpiryAsUntrustedCacheBound(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	validID := jwtWithPayload(`{"sub":"probe","exp":` + fmt.Sprint(now.Add(24*time.Hour).Unix()) + `}`)
+	for _, test := range []struct {
+		name string
+		id   string
+		want *time.Time
+	}{
+		{name: "numeric date", id: validID, want: timePtr(now.Add(24 * time.Hour))},
+		{name: "fractional numeric date", id: jwtWithPayload(`{"exp":` + fmt.Sprint(now.Add(time.Minute).Unix()) + ".5}"), want: timePtr(now.Add(time.Minute + 500*time.Millisecond))},
+		{name: "opaque id", id: "opaque-upstream-id"},
+		{name: "bad base64 payload", id: "header.@@@.signature"},
+		{name: "malformed payload", id: jwtWithPayload("{")},
+		{name: "missing exp", id: jwtWithPayload(`{"sub":"probe"}`)},
+		{name: "string exp", id: jwtWithPayload(`{"exp":"1767225600"}`)},
+		{name: "null exp", id: jwtWithPayload(`{"exp":null}`)},
+		{name: "overflow exp", id: jwtWithPayload(`{"exp":1e1000}`)},
+		{name: "wrong token shape", id: "header.payload"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"id":%q,"blocked":false}`, test.id)
+			}))
+			defer server.Close()
+			client := NewWithHTTPClient(server.URL, server.Client())
+			client.now = func() time.Time { return now }
+			result, err := client.Check(context.Background(), "edge.example")
+			if err != nil {
+				t.Fatalf("primary check failed while parsing expiry: %v", err)
+			}
+			gotExpiryMissing, wantExpiryMissing := result.UpstreamExpiresAt == nil, test.want == nil
+			if result.ID != test.id || !result.ProbeAvailable || gotExpiryMissing != wantExpiryMissing {
+				t.Fatalf("result=%+v want exp=%v", result, test.want)
+			}
+			if test.want != nil && !result.UpstreamExpiresAt.Equal(*test.want) {
+				t.Fatalf("expiry=%s want=%s", result.UpstreamExpiresAt, test.want)
+			}
+		})
+	}
+}
+
+func jwtWithPayload(payload string) string {
+	return "header." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".signature"
+}
+
+func timePtr(value time.Time) *time.Time { return &value }
 
 func TestCheckClassifiesRateLimitAndRetryAfter(t *testing.T) {
 	for _, test := range []struct {
@@ -95,6 +143,80 @@ func TestProbeClassifiesExpiredAndUnavailableResponses(t *testing.T) {
 		t.Fatalf("empty remote id error=%v", err)
 	}
 }
+
+func TestProbeErrorsNeverExposeJWTFromURLOrTransport(t *testing.T) {
+	id := "secret-header.secret-payload.secret-signature"
+	transportError := fmt.Errorf("dial failed for %s: %w", "https://cheburcheck.invalid/api/v1/probe/"+id, errors.New("connection refused"))
+	cases := []struct {
+		name   string
+		client *http.Client
+		wantIs error
+	}{
+		{
+			name: "transport error",
+			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("round trip failed at %s: %w", req.URL, transportError)
+			})},
+		},
+		{
+			name: "context cancellation",
+			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("cancelled request %s: %w", req.URL, context.Canceled)
+			})},
+			wantIs: context.Canceled,
+		},
+		{
+			name: "context deadline",
+			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("deadline for %s: %w", req.URL, context.DeadlineExceeded)
+			})},
+			wantIs: context.DeadlineExceeded,
+		},
+		{
+			name: "stream read error",
+			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(failedReader{err: fmt.Errorf("stream %s failed", req.URL)}), Request: req}, nil
+			})},
+		},
+		{
+			name: "http status text",
+			client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusInternalServerError, Status: "500 " + id, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			})},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewWithHTTPClient("https://cheburcheck.invalid", test.client).Probe(context.Background(), id)
+			if err == nil {
+				t.Fatal("expected probe error")
+			}
+			for _, secret := range append([]string{id}, strings.Split(id, ".")...) {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("probe error leaked JWT segment %q: %v", secret, err)
+				}
+			}
+			if test.wantIs != nil && !errors.Is(err, test.wantIs) {
+				t.Fatalf("probe error=%v does not preserve %v", err, test.wantIs)
+			}
+		})
+	}
+
+	badURLClient := NewWithHTTPClient("https://invalid\n"+id, http.DefaultClient)
+	_, err := badURLClient.Probe(context.Background(), id)
+	if err == nil {
+		t.Fatal("invalid probe URL was accepted")
+	}
+	for _, secret := range append([]string{id}, strings.Split(id, ".")...) {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("request construction error leaked JWT segment %q: %v", secret, err)
+		}
+	}
+}
+
+type failedReader struct{ err error }
+
+func (r failedReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestClientDefaultsAndHTTPDateRetryAfter(t *testing.T) {
 	client := New()
@@ -194,7 +316,7 @@ func TestClientReportsHTTPBodyAndSSEStreamFailures(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("upstream")), Request: req}, nil
 	})})
-	if _, err := client.Check(context.Background(), "edge.example"); err == nil || !strings.Contains(err.Error(), "HTTP 502") {
+	if _, err := client.Check(context.Background(), "edge.example"); err == nil || !strings.Contains(err.Error(), "HTTP status 502") {
 		t.Fatalf("HTTP failure = %v", err)
 	}
 	if _, err := client.Probe(context.Background(), "probe-id"); err == nil || !strings.Contains(err.Error(), "read cheburcheck probe stream") {

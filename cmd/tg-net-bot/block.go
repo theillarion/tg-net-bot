@@ -159,7 +159,7 @@ func newBlockCommandWith(factory blockCLIFactory) *cobra.Command {
 		},
 	}
 	cmd.PersistentFlags().StringVar(&redisURL, "redis-url", "", "Redis address or redis:// URL (overrides REDIS_ADDR)")
-	cmd.PersistentFlags().DurationVar(&cacheTTL, "cache-ttl", 3*time.Hour, "Probe context lifetime (overrides BLOCKCHECK_CACHE_TTL)")
+	cmd.PersistentFlags().DurationVar(&cacheTTL, "cache-ttl", 24*time.Hour, "Maximum probe context lifetime; upstream expiry always wins (overrides BLOCKCHECK_CACHE_TTL)")
 	cmd.Flags().StringVar(&output, "output", "text", "Output format: text, json, or ndjson")
 	cmd.AddCommand(newBlockProbeCommandWith(factory, &redisURL, &cacheTTL))
 	return cmd

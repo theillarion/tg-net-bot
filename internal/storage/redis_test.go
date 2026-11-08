@@ -81,7 +81,8 @@ func (c *fakeRedisClient) Close() error { c.closed = true; return c.closeErr }
 func TestRedisCacheRoundTripTTLAndExpiredWrite(t *testing.T) {
 	client := newFakeRedisClient()
 	cache := NewRedisCache(client)
-	result := blockcheck.Result{ID: "upstream-id", CacheKey: "cache-key", Target: "example.net", CheckedAt: time.Now(), Blocked: true}
+	upstreamExpiry := time.Now().Add(30 * time.Minute)
+	result := blockcheck.Result{ID: "upstream-id", CacheKey: "cache-key", Target: "example.net", CheckedAt: time.Now(), Blocked: true, UpstreamExpiresAt: &upstreamExpiry}
 	expiresAt := time.Now().Add(time.Minute)
 	if err := cache.Save(context.Background(), result.CacheKey, result, expiresAt); err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ func TestRedisCacheRoundTripTTLAndExpiredWrite(t *testing.T) {
 		t.Fatalf("TTL=%s", client.lastTTL)
 	}
 	got, err := NewRedisCache(newRedisClientView(client)).Get(context.Background(), result.CacheKey)
-	if err != nil || got.ID != result.ID || got.CacheKey != result.CacheKey || got.Target != result.Target || !got.CheckedAt.Equal(result.CheckedAt) || !got.Blocked {
+	if err != nil || got.ID != result.ID || got.CacheKey != result.CacheKey || got.Target != result.Target || !got.CheckedAt.Equal(result.CheckedAt) || got.UpstreamExpiresAt == nil || !got.UpstreamExpiresAt.Equal(upstreamExpiry) || !got.Blocked {
 		t.Fatalf("shared read result=%+v err=%v", got, err)
 	}
 	if err := cache.Save(context.Background(), "expired", result, time.Now().Add(-time.Second)); err != nil {

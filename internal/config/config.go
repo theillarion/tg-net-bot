@@ -62,7 +62,7 @@ func LoadBlockCheckSettings() (string, string, time.Duration, error) {
 	if err := validateRedisAddress(address); err != nil {
 		return "", "", 0, fmt.Errorf("REDIS_ADDR must be host:port or a redis:// URL: %w", err)
 	}
-	ttl := 3 * time.Hour
+	ttl := 24 * time.Hour
 	if raw := strings.TrimSpace(os.Getenv("BLOCKCHECK_CACHE_TTL")); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil || parsed <= 0 {

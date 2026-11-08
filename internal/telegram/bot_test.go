@@ -151,6 +151,30 @@ func (b botBlock) CheckBatch(ctx context.Context, targets []string, emit func(bl
 	return nil
 }
 
+type fixedBlockResult struct {
+	result blockcheck.Result
+	err    error
+}
+
+func (b fixedBlockResult) Check(_ context.Context, target string) (blockcheck.Result, error) {
+	result := b.result
+	if result.Target == "" {
+		result.Target = target
+	}
+	return result, b.err
+}
+func (fixedBlockResult) Probe(context.Context, string) (blockcheck.ProbeResult, error) {
+	return blockcheck.ProbeResult{}, nil
+}
+func (b fixedBlockResult) CheckBatch(ctx context.Context, targets []string, emit func(blockcheck.BatchItem)) error {
+	for _, target := range targets {
+		result := b.result
+		result.Target = target
+		emit(blockcheck.BatchItem{Target: target, Result: result, Status: "complete"})
+	}
+	return nil
+}
+
 type botProbeBlock struct {
 	botBlock
 	result blockcheck.ProbeResult
@@ -315,6 +339,64 @@ func TestBotMessagesAndButtons(t *testing.T) {
 	b.handleMessage(ctx, msg("/add"))
 	b.handleMessage(ctx, msg("/start"))
 }
+
+func TestManualBlockKeyboardReflectsProbeExpiryAvailability(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		result    blockcheck.Result
+		err       error
+		wantProbe bool
+		wantText  string
+	}{
+		{name: "valid ID within bound", result: blockcheck.Result{ID: "jwt-id", CacheKey: "usable-key", ProbeAvailable: true, UpstreamExpiresAt: testTelegramTimePtr(time.Now().Add(time.Hour))}, wantProbe: true},
+		{name: "expired ID", result: blockcheck.Result{ID: "jwt-id", ProbeAvailable: false, UpstreamExpiresAt: testTelegramTimePtr(time.Now().Add(-time.Second))}},
+		{name: "cache save failure", result: blockcheck.Result{ID: "jwt-id", CacheKey: "failed-key", ProbeAvailable: true}, err: &blockcheck.CacheWriteError{Err: errors.New("Redis unavailable")}, wantText: "контекст probe не сохранён"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var payloads []map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
+					mu.Lock()
+					payloads = append(payloads, payload)
+					mu.Unlock()
+				}
+				_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+			}))
+			defer server.Close()
+			api := &API{token: "x", client: server.Client(), baseURL: server.URL}
+			repo := &botRepo{state: domain.EmptyState()}
+			service, err := monitor.New(context.Background(), repo, botNetwork{}, fixedBlockResult{result: test.result, err: test.err}, api, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bot := NewBot(api, service, map[int64]struct{}{1: {}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			bot.manualBlock(context.Background(), 10, "edge.example")
+			mu.Lock()
+			defer mu.Unlock()
+			if len(payloads) < 2 {
+				t.Fatalf("expected initial and result screens, got %d", len(payloads))
+			}
+			last, err := json.Marshal(payloads[len(payloads)-1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasProbe := strings.Contains(string(last), "block-probe:")
+			if hasProbe != test.wantProbe {
+				t.Fatalf("probe action present=%v want=%v screen=%s", hasProbe, test.wantProbe, last)
+			}
+			if test.wantText != "" && !strings.Contains(string(last), test.wantText) {
+				t.Fatalf("primary result/cache error missing %q: %s", test.wantText, last)
+			}
+			if test.name == "cache save failure" && !strings.Contains(string(last), "edge.example") {
+				t.Fatalf("successful primary result was lost: %s", last)
+			}
+		})
+	}
+}
+
+func testTelegramTimePtr(value time.Time) *time.Time { return &value }
 func TestBotPendingEdgeCasesAndEmptyLists(t *testing.T) {
 	b, _, _ := setupBot(t)
 	ctx := context.Background()
@@ -842,7 +924,7 @@ type botBatchStatuses struct{ botBlock }
 
 func (botBatchStatuses) CheckBatch(_ context.Context, targets []string, emit func(blockcheck.BatchItem)) error {
 	statuses := []blockcheck.BatchItem{
-		{Target: targets[0], Status: "complete", Result: blockcheck.Result{Target: targets[0], Blocked: false, CacheKey: "probe-key"}, Error: "cache write failed"},
+		{Target: targets[0], Status: "cache_failed", Result: blockcheck.Result{Target: targets[0], Blocked: false}, Error: "cache write failed"},
 		{Target: targets[1], Status: "limited", Error: "rate limited"},
 		{Target: targets[2], Status: "skipped", Error: "not sent"},
 		{Target: targets[3], Status: "failed", Error: "provider failed"},
@@ -1407,14 +1489,18 @@ func TestBlockBatchRendersPartialResultsLimitsAndStopReason(t *testing.T) {
 	var mu sync.Mutex
 	var sent []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Error(readErr)
+		}
 		var payload struct {
 			Text string `json:"text"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Error(err)
 		}
 		mu.Lock()
-		sent = append(sent, payload.Text)
+		sent = append(sent, string(body))
 		mu.Unlock()
 		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
 			io.WriteString(w, `{"ok":true,"result":{"message_id":77}}`)
@@ -1447,10 +1533,13 @@ func TestBlockBatchRendersPartialResultsLimitsAndStopReason(t *testing.T) {
 	mu.Lock()
 	joined := strings.Join(sent, "\n")
 	mu.Unlock()
-	for _, want := range []string{"лимит запросов", "пропущено из-за лимита", "ошибка", "кеш недоступен", "отменено", "Пакетная проверка остановлена: batch stopped"} {
+	for _, want := range []string{"лимит запросов", "пропущено из-за лимита", "ошибка", "кеш недоступен", "cache write failed", "отменено", "Пакетная проверка остановлена: batch stopped"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("partial batch output missing %q: %s", want, joined)
 		}
+	}
+	if strings.Contains(joined, "block-probe:") {
+		t.Fatalf("cache-failed result exposed a probe button: %s", joined)
 	}
 }
 

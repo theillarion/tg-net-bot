@@ -64,7 +64,7 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open fun
 	}()
 	cacheTTL := cfg.BlockCheckCacheTTL
 	if cacheTTL <= 0 {
-		cacheTTL = 3 * time.Hour
+		cacheTTL = 24 * time.Hour
 	}
 	blockService, err := blockcheck.New(cheburcheck.New(), blockCache, cacheTTL)
 	if err != nil {

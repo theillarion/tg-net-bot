@@ -77,6 +77,8 @@ type fakeCache struct {
 	err     error
 }
 
+func testTimePtr(value time.Time) *time.Time { return &value }
+
 func newFakeCache() *fakeCache {
 	return &fakeCache{entries: map[string]Result{}, expiry: map[string]time.Time{}}
 }
@@ -146,6 +148,52 @@ func TestCheckStoresPrimaryContextAndUsesConfiguredRatePolicy(t *testing.T) {
 	cached, err := cache.Get(context.Background(), result.CacheKey)
 	if err != nil || cached.ID != result.ID || cached.Target != result.Target || !cache.expiry[result.CacheKey].Equal(now.Add(time.Hour)) {
 		t.Fatalf("cached=%+v err=%v", cached, err)
+	}
+}
+
+func TestCheckBoundsCacheLifetimeByUpstreamExpiryAndFallback(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name      string
+		ttl       time.Duration
+		upstream  *time.Time
+		wantUntil time.Duration
+	}{
+		{name: "upstream exp before default ttl", ttl: 24 * time.Hour, upstream: testTimePtr(now.Add(4 * time.Minute)), wantUntil: 4 * time.Minute},
+		{name: "configured ttl before upstream exp", ttl: time.Hour, upstream: testTimePtr(now.Add(36 * time.Hour)), wantUntil: time.Hour},
+		{name: "unknown exp uses fallback", ttl: 24 * time.Hour, wantUntil: 3 * time.Hour},
+		{name: "short configured ttl retained for unknown exp", ttl: time.Hour, wantUntil: time.Hour},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cache := newFakeCache()
+			provider := &fakeProvider{results: []Result{{ID: "remote-id", UpstreamExpiresAt: test.upstream}}}
+			service := serviceForTest(t, provider, cache, test.ttl)
+			service.now = func() time.Time { return now }
+			result, err := service.Check(context.Background(), "edge.example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.CacheKey == "" || !result.ProbeAvailable || !cache.expiry[result.CacheKey].Equal(now.Add(test.wantUntil)) {
+				t.Fatalf("result=%+v expiry=%s want=%s", result, cache.expiry[result.CacheKey], now.Add(test.wantUntil))
+			}
+		})
+	}
+}
+
+func TestCheckSkipsCacheForAlreadyExpiredUpstreamID(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, expiry := range []time.Time{now, now.Add(-time.Second)} {
+		cache := newFakeCache()
+		provider := &fakeProvider{results: []Result{{ID: "expired-id", UpstreamExpiresAt: &expiry}}}
+		service := serviceForTest(t, provider, cache, 24*time.Hour)
+		service.now = func() time.Time { return now }
+		result, err := service.Check(context.Background(), "edge.example")
+		if err != nil || result.ID != "expired-id" || result.CacheKey != "" || result.ProbeAvailable {
+			t.Fatalf("primary result=%+v error=%v", result, err)
+		}
+		if len(cache.entries) != 0 {
+			t.Fatalf("expired ID was saved: %+v", cache.entries)
+		}
 	}
 }
 
@@ -227,6 +275,52 @@ func TestProbeExpiredAndStorageFailure(t *testing.T) {
 	cache.err = errors.New("disk unavailable")
 	if _, err := service.Probe(context.Background(), "expired"); err == nil || !errors.Is(err, cache.err) {
 		t.Fatalf("cache error=%v", err)
+	}
+}
+
+func TestProbeRechecksUpstreamExpiryAndLegacyFallback(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name     string
+		result   Result
+		wantCall bool
+	}{
+		{name: "cached upstream expiry elapsed", result: Result{ID: "jwt-id", ProbeAvailable: true, CheckedAt: now.Add(-time.Minute), UpstreamExpiresAt: testTimePtr(now)}},
+		{name: "legacy cache uses maximum fallback", result: Result{ID: "legacy-id", ProbeAvailable: true, CheckedAt: now.Add(-3 * time.Hour)}},
+		{name: "legacy cache remains usable inside fallback", result: Result{ID: "legacy-id", ProbeAvailable: true, CheckedAt: now.Add(-2 * time.Hour)}, wantCall: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeProvider{}
+			cache := newFakeCache()
+			cache.entries["cached"] = test.result
+			service := serviceForTest(t, provider, cache, 24*time.Hour)
+			service.now = func() time.Time { return now }
+			_, err := service.Probe(context.Background(), "cached")
+			if test.wantCall {
+				if err != nil || provider.probeCalls != 1 {
+					t.Fatalf("probe error=%v provider calls=%d", err, provider.probeCalls)
+				}
+			} else if !errors.Is(err, ErrExpired) || provider.probeCalls != 0 {
+				t.Fatalf("probe error=%v provider calls=%d", err, provider.probeCalls)
+			}
+		})
+	}
+}
+
+func TestProbeDoesNotCallProviderIfExpiryPassesWhileWaiting(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	upstreamExpiry := now.Add(time.Second)
+	provider := &fakeProvider{}
+	cache := newFakeCache()
+	cache.entries["near-expiry"] = Result{ID: "jwt-id", ProbeAvailable: true, CheckedAt: now, UpstreamExpiresAt: &upstreamExpiry}
+	service := serviceForTest(t, provider, cache, 24*time.Hour)
+	service.now = func() time.Time { return now }
+	service.wait = func(context.Context, time.Duration) error {
+		now = now.Add(2 * time.Second)
+		return nil
+	}
+	if _, err := service.Probe(context.Background(), "near-expiry"); !errors.Is(err, ErrExpired) || provider.probeCalls != 0 {
+		t.Fatalf("probe error=%v provider calls=%d", err, provider.probeCalls)
 	}
 }
 
@@ -313,8 +407,22 @@ func TestCheckReportsCacheWriteFailureWithoutDroppingPrimaryResult(t *testing.T)
 	cache.err = errors.New("disk full")
 	service := serviceForTest(t, provider, cache, time.Hour)
 	result, err := service.Check(context.Background(), "edge.example")
-	if err == nil || !errors.Is(err, cache.err) || result.Target != "edge.example" || !result.ProbeAvailable {
+	var cacheErr *CacheWriteError
+	if err == nil || !errors.Is(err, cache.err) || !errors.As(err, &cacheErr) || result.Target != "edge.example" || result.ProbeAvailable || result.CacheKey != "" {
 		t.Fatalf("partial result=%+v error=%v", result, err)
+	}
+}
+
+func TestCheckBatchPreservesPrimaryResultOnCacheWriteFailure(t *testing.T) {
+	cache := newFakeCache()
+	cache.err = errors.New("Redis unavailable")
+	service := serviceForTest(t, &fakeProvider{}, cache, time.Hour)
+	var items []BatchItem
+	if err := service.CheckBatch(context.Background(), []string{"edge.example"}, func(item BatchItem) { items = append(items, item) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != "cache_failed" || !strings.Contains(items[0].Error, "Redis unavailable") || items[0].Result.Target != "edge.example" || items[0].Result.CacheKey != "" || items[0].Result.ProbeAvailable {
+		t.Fatalf("batch result=%+v", items)
 	}
 }
 

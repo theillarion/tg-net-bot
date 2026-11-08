@@ -31,11 +31,11 @@ go run ./cmd/tg-net-bot check --method tcp --arg 443 example.com
 go run ./cmd/tg-net-bot check --method icmp 2001:db8::1
 go run ./cmd/tg-net-bot block example.com another.example --output json
 go run ./cmd/tg-net-bot block probe <cache-key>
-go run ./cmd/tg-net-bot block example.com --redis-url 127.0.0.1:6379 --cache-ttl 3h
+go run ./cmd/tg-net-bot block example.com --redis-url 127.0.0.1:6379
 go run ./cmd/tg-net-bot serve
 ```
 
-Команда `check` выводит JSON в stdout — его можно передать, например, в `jq`. `block` принимает одну или несколько целей и поддерживает `text`, `json` и `ndjson`. Команда `block probe <cache-key>` вручную запускает расширенную проверку по сохранённому результату. Обе команды используют общий Redis из `REDIS_ADDR` (по умолчанию `127.0.0.1:6379`); `--redis-url` переопределяет адрес. Срок хранения задаётся `BLOCKCHECK_CACHE_TTL` (по умолчанию 3 часа), а `--cache-ttl` переопределяет его для CLI. Неиспользуемая таблица старого cache может оставаться в SQLite; новые записи туда не выполняются. Фактический срок жизни ID у Cheburcheck не подтверждён. Текущие defaults upstream — 30 check/мин и 5 probe/мин, burst 1; настройки production могут отличаться. Команда `serve` использует те же Redis-настройки. Справка по командам: `go run ./cmd/tg-net-bot --help`.
+Команда `check` выводит JSON в stdout — его можно передать, например, в `jq`. `block` принимает одну или несколько целей и поддерживает `text`, `json` и `ndjson`. Команда `block probe <cache-key>` вручную запускает расширенную проверку по сохранённому результату. Обе команды используют общий Redis из `REDIS_ADDR` (по умолчанию `127.0.0.1:6379`); `--redis-url` переопределяет адрес. Срок хранения задаётся `BLOCKCHECK_CACHE_TTL` (по умолчанию 24 часа), а `--cache-ttl` переопределяет максимум для CLI. Непроверенный JWT `exp` от Cheburcheck ограничивает срок cache и probe; для ID без корректного `exp` используется максимум 3 часа. Этот claim используется только как верхняя граница локального срока. Неиспользуемая таблица старого cache может оставаться в SQLite; новые записи туда не выполняются. Текущие defaults upstream — 30 check/мин и 5 probe/мин, burst 1; настройки production могут отличаться. Команда `serve` использует те же Redis-настройки. Справка по командам: `go run ./cmd/tg-net-bot --help`.
 
 ## Структура проекта
 

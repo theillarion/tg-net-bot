@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -74,7 +77,49 @@ func (c *Client) Check(ctx context.Context, target string) (blockcheck.Result, e
 	}
 	result.CheckedAt = c.now()
 	result.ProbeAvailable = result.ID != ""
+	result.UpstreamExpiresAt = jwtExpiry(result.ID)
 	return result, nil
+}
+
+// jwtExpiry reads only the untrusted NumericDate claim. It is a cache lifetime
+// hint and must never be used to authenticate or authorize a request.
+func jwtExpiry(id string) *time.Time {
+	parts := strings.Split(id, ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	rawExp, ok := claims["exp"]
+	if !ok {
+		return nil
+	}
+	rawExp = bytes.TrimSpace(rawExp)
+	if len(rawExp) == 0 || (rawExp[0] != '-' && (rawExp[0] < '0' || rawExp[0] > '9')) {
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(rawExp, &number); err != nil {
+		return nil
+	}
+	seconds, err := strconv.ParseFloat(number.String(), 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < -float64(1<<63) || seconds >= float64(1<<63) {
+		return nil
+	}
+	wholeSeconds := math.Floor(seconds)
+	nanoseconds := math.Round((seconds - wholeSeconds) * float64(time.Second))
+	if nanoseconds >= float64(time.Second) {
+		wholeSeconds++
+		nanoseconds = 0
+	}
+	expiresAt := time.Unix(int64(wholeSeconds), int64(nanoseconds)).UTC()
+	return &expiresAt
 }
 
 // Probe runs the expensive per-scanner check only on explicit request.
@@ -88,11 +133,11 @@ func (c *Client) ProbeWithEvents(ctx context.Context, id string, emit func(block
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+probeRoute+url.PathEscape(id), nil)
 	if err != nil {
-		return blockcheck.ProbeResult{}, fmt.Errorf("create cheburcheck probe request: %w", err)
+		return blockcheck.ProbeResult{}, safeProbeError("create cheburcheck probe request", "request is invalid", err)
 	}
 	res, err := c.httpClient.Do(req)
 	if err != nil {
-		return blockcheck.ProbeResult{}, fmt.Errorf("call cheburcheck probe: %w", err)
+		return blockcheck.ProbeResult{}, safeProbeError("call cheburcheck probe", "transport request failed", err)
 	}
 	defer res.Body.Close()
 	if err := responseError(res, probeRoute); err != nil {
@@ -178,7 +223,7 @@ func (c *Client) ProbeWithEvents(ctx context.Context, id string, emit func(block
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return result, fmt.Errorf("read cheburcheck probe stream: %w", err)
+		return result, safeProbeError("read cheburcheck probe stream", "transport read failed", err)
 	}
 	if err := flush(); err != nil {
 		return result, err
@@ -192,6 +237,25 @@ func (c *Client) ProbeWithEvents(ctx context.Context, id string, emit func(block
 	return result, nil
 }
 
+type sanitizedProbeError struct {
+	message string
+	cause   error
+}
+
+func (e *sanitizedProbeError) Error() string { return e.message }
+func (e *sanitizedProbeError) Unwrap() error { return e.cause }
+
+func safeProbeError(operation, detail string, err error) error {
+	var safeCause error
+	switch {
+	case errors.Is(err, context.Canceled):
+		safeCause = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		safeCause = context.DeadlineExceeded
+	}
+	return &sanitizedProbeError{message: operation + ": " + detail, cause: safeCause}
+}
+
 func responseError(res *http.Response, route string) error {
 	if route == probeRoute && res.StatusCode == http.StatusNotFound {
 		return blockcheck.ErrExpired
@@ -201,7 +265,7 @@ func responseError(res *http.Response, route string) error {
 		return &blockcheck.RateLimitError{Provider: "Cheburcheck", Route: route, RetryAfter: retryAfter}
 	}
 	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("cheburcheck returned HTTP %s", res.Status)
+		return fmt.Errorf("cheburcheck returned HTTP status %d", res.StatusCode)
 	}
 	return nil
 }

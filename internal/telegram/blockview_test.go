@@ -21,7 +21,7 @@ func TestFormatBlockResultShowsAvailableFieldsAndEscapesSourceText(t *testing.T)
 		SubnetSize: stringPtr("24"), ReverseLookup: []string{"ptr.example"}, ProbeAvailable: true, CacheKey: "key",
 	}
 	got := formatBlockResult(result)
-	for _, want := range []string{"host.example", "найдено в базовых списках", "192.0.2.4", "Cloud (1)", "ptr.example", "today", "24", "локально 3 часа"} {
+	for _, want := range []string{"host.example", "найдено в базовых списках", "192.0.2.4", "Cloud (1)", "ptr.example", "today", "24", "до допустимого срока действия ID"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("card missing %q: %s", want, got)
 		}
@@ -95,7 +95,21 @@ func TestBlockResultsKeyboardAddsProbeOnlyWhenAvailable(t *testing.T) {
 	if len(probeButtons) != 1 || probeButtons[0].CallbackData != "block-probe:short-key" {
 		t.Fatalf("probe buttons = %+v", probeButtons)
 	}
+	if rows := blockResultsKeyboard([]operationResult{{target: domain.Target{Name: "expired"}, cacheKey: ""}}); hasProbeButton(rows) {
+		t.Fatalf("expired result exposes probe action: %+v", rows)
+	}
 	if rows := blockResultsKeyboard(nil); len(rows) == 0 {
 		t.Fatal("navigation row missing for empty result set")
 	}
+}
+
+func hasProbeButton(rows [][]InlineButton) bool {
+	for _, row := range rows {
+		for _, button := range row {
+			if strings.HasPrefix(button.CallbackData, "block-probe:") {
+				return true
+			}
+		}
+	}
+	return false
 }

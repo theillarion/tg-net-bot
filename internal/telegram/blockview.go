@@ -34,7 +34,7 @@ func formatBlockResult(result blockcheck.Result) string {
 	fmt.Fprintf(&out, "Reverse DNS: %s\n", html.EscapeString(joinOrUnknown(result.ReverseLookup)))
 	fmt.Fprintf(&out, "Жалобы: %s\n", html.EscapeString(rawListOrUnknown(result.Complaints)))
 	if result.ProbeAvailable && result.CacheKey != "" {
-		out.WriteString("\nРасширенный probe не запускался — это отдельный запрос с лимитом 5/мин (default Cheburcheck; deployment может отличаться). ID хранится локально 3 часа; срок жизни на стороне источника не подтверждён.")
+		out.WriteString("\nРасширенный probe не запускался — это отдельный запрос с лимитом 5/мин (default Cheburcheck; deployment может отличаться). Контекст probe хранится только до допустимого срока действия ID.")
 	} else {
 		out.WriteString("\nID расширенного probe недоступен.")
 	}

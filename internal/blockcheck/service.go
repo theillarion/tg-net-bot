@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/theillarion/tg-net-bot/internal/checker"
 )
+
+const unknownUpstreamExpiryTTL = 3 * time.Hour
 
 type Service struct {
 	provider  PrimaryChecker
@@ -58,17 +61,43 @@ func (s *Service) Check(ctx context.Context, target string) (Result, error) {
 	}
 	result.CheckedAt = s.now()
 	result.ProbeAvailable = result.ID != ""
-	if result.ID != "" && s.cache != nil {
+	result.CacheKey = ""
+	if result.ID != "" {
+		expiresAt, cacheable := cacheExpiry(result.CheckedAt, s.ttl, result.UpstreamExpiresAt)
+		if !cacheable {
+			result.ProbeAvailable = false
+			return result, nil
+		}
 		key := make([]byte, 9)
 		if _, err := rand.Read(key); err != nil {
 			return result, fmt.Errorf("create extended check key: %w", err)
 		}
 		result.CacheKey = base64.RawURLEncoding.EncodeToString(key)
-		if err := s.cache.Save(ctx, result.CacheKey, result, result.CheckedAt.Add(s.ttl)); err != nil {
-			return result, fmt.Errorf("cache extended check context: %w", err)
+		if err := s.cache.Save(ctx, result.CacheKey, result, expiresAt); err != nil {
+			result.CacheKey = ""
+			result.ProbeAvailable = false
+			return result, &CacheWriteError{Err: err}
 		}
 	}
 	return result, nil
+}
+
+func cacheExpiry(checkedAt time.Time, configuredTTL time.Duration, upstreamExpiry *time.Time) (time.Time, bool) {
+	ttl := configuredTTL
+	if upstreamExpiry == nil {
+		if ttl > unknownUpstreamExpiryTTL {
+			ttl = unknownUpstreamExpiryTTL
+		}
+		return checkedAt.Add(ttl), true
+	}
+	if !upstreamExpiry.After(checkedAt) {
+		return time.Time{}, false
+	}
+	localExpiry := checkedAt.Add(ttl)
+	if upstreamExpiry.Before(localExpiry) {
+		return *upstreamExpiry, true
+	}
+	return localExpiry, true
 }
 
 type BatchItem struct {
@@ -99,7 +128,10 @@ func (s *Service) CheckBatch(ctx context.Context, targets []string, emit func(Ba
 				return canceled
 			}
 			status := "failed"
-			if _, ok := err.(*RateLimitError); ok {
+			var cacheWriteErr *CacheWriteError
+			if errors.As(err, &cacheWriteErr) {
+				status = "cache_failed"
+			} else if _, ok := err.(*RateLimitError); ok {
 				status = "limited"
 			}
 			emit(BatchItem{Target: target, Result: result, Status: status, Error: err.Error()})
@@ -134,11 +166,15 @@ func (s *Service) ProbeWithEvents(ctx context.Context, key string, emit func(Pro
 	if !result.ProbeAvailable || result.ID == "" {
 		return ProbeResult{}, ErrNotFound
 	}
-	if s.now().Sub(result.CheckedAt) >= s.ttl {
+	expiresAt, cacheable := cacheExpiry(result.CheckedAt, s.ttl, result.UpstreamExpiresAt)
+	if !cacheable || !expiresAt.After(s.now()) {
 		return ProbeResult{}, ErrExpired
 	}
 	if err := s.waitForSlot(ctx, 12*time.Second, &s.nextProbe); err != nil {
 		return ProbeResult{}, err
+	}
+	if !expiresAt.After(s.now()) {
+		return ProbeResult{}, ErrExpired
 	}
 	if s.probe == nil {
 		return ProbeResult{}, fmt.Errorf("extended probe is not supported by this provider")

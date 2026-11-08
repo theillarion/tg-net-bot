@@ -1258,13 +1258,15 @@ func (b *Bot) startOperation(parent context.Context, chatID int64, action string
 					status = "ошибка"
 				case "canceled":
 					status = "отменено"
+				case "cache_failed":
+					status = "база проверена · кеш недоступен"
 				}
 				detail, cacheKey := html.EscapeString(item.Error), ""
 				if item.Result.Target != "" {
 					detail = formatBlockResult(item.Result)
 					cacheKey = item.Result.CacheKey
-					if item.Error != "" {
-						status = "база проверена · кеш недоступен"
+					if item.Status == "cache_failed" {
+						detail += "\n\nКонтекст probe не сохранён: " + html.EscapeString(item.Error)
 					}
 				}
 				results = append(results, operationResult{target: target, status: status, detail: detail, cacheKey: cacheKey})
@@ -1492,6 +1494,14 @@ func (b *Bot) manualBlock(ctx context.Context, chatID int64, target string) {
 	defer cancel()
 	result, err := b.service.Block(checkCtx, target)
 	if err != nil {
+		var cacheWriteErr *blockcheck.CacheWriteError
+		if errors.As(err, &cacheWriteErr) && result.Target != "" {
+			result.CacheKey = ""
+			result.ProbeAvailable = false
+			message := formatBlockResult(result) + "\n\nБазовый результат получен, но контекст probe не сохранён: " + html.EscapeString(cacheWriteErr.Err.Error())
+			b.render(ctx, chatID, message, blockResultsKeyboard([]operationResult{{target: domain.Target{Name: target, Host: target}, status: "база проверена · кеш недоступен"}}))
+			return
+		}
 		b.render(ctx, chatID, "Проверка не завершилась: "+html.EscapeString(err.Error()), navigationKeyboard("menu:services"))
 		return
 	}
