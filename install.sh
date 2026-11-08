@@ -31,28 +31,36 @@ fi
 cd "$INSTALL_DIR"
 printf 'Installing in: %s\n' "$PWD"
 
+configure_env=yes
 if [ -f .env ]; then
   printf 'Existing .env found. Replace it? [y/N] '
-  read answer
-  case "$answer" in y|Y|yes|YES) ;; *) echo "Keeping existing configuration."; exit 0 ;; esac
+  if ! IFS= read -r answer; then
+    answer=
+  fi
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) echo "Keeping existing configuration."; configure_env=no ;;
+  esac
 fi
 
-printf 'Telegram bot token (from @BotFather): '
-read token
-if [ -z "$token" ]; then echo "Token is required." >&2; exit 1; fi
-printf 'Allowed Telegram user IDs (comma separated): '
-read users
-if [ -z "$users" ]; then echo "At least one user ID is required." >&2; exit 1; fi
-printf 'Telegram proxy URL (optional, press Enter to skip): '
-read proxy
+if [ "$configure_env" = yes ]; then
+  printf 'Telegram bot token (from @BotFather): '
+  read token
+  if [ -z "$token" ]; then echo "Token is required." >&2; exit 1; fi
+  printf 'Allowed Telegram user IDs (comma separated): '
+  read users
+  if [ -z "$users" ]; then echo "At least one user ID is required." >&2; exit 1; fi
+  printf 'Telegram proxy URL (optional, press Enter to skip): '
+  read proxy
 
-umask 077
-{
-  printf 'TELEGRAM_TOKEN=%s\n' "$token"
-  printf 'TALAGRAM_ALLOW_USERS=%s\n' "$users"
-  printf 'TELEGRAM_PROXY=%s\n' "$proxy"
-  printf 'DATABASE_PATH=/app/data/tg-net-bot.sqlite\n'
-} > .env
+  umask 077
+  {
+    printf 'TELEGRAM_TOKEN=%s\n' "$token"
+    printf 'TALAGRAM_ALLOW_USERS=%s\n' "$users"
+    printf 'TELEGRAM_PROXY=%s\n' "$proxy"
+    printf 'DATABASE_PATH=/app/data/tg-net-bot.sqlite\n'
+  } > .env
+fi
 mkdir -p data
 if docker container inspect tg-net-bot >/dev/null 2>&1; then
   printf 'An existing container named tg-net-bot is running. Remove it before starting this installation? [y/N] '
