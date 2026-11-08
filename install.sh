@@ -27,6 +27,9 @@ fi
 
 if [ ! -d "$INSTALL_DIR/.git" ]; then
   git clone "$REPO_URL" "$INSTALL_DIR"
+else
+  printf 'Updating existing checkout: %s\n' "$INSTALL_DIR"
+  git -C "$INSTALL_DIR" pull --ff-only
 fi
 cd "$INSTALL_DIR"
 printf 'Installing in: %s\n' "$PWD"
