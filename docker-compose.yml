@@ -1,4 +1,18 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: tg-net-tools-redis
+    restart: unless-stopped
+    # Host networking lets the host CLI share the cache while Redis remains loopback-only.
+    network_mode: host
+    env_file: .env
+    command: ["sh", "-c", "if [ -n \"$$REDIS_PASSWORD\" ]; then exec redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no --requirepass \"$$REDIS_PASSWORD\"; else exec redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no; fi"]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli -h 127.0.0.1 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+      start_period: 2s
   bot:
     build: .
     container_name: tg-net-tools-bot
@@ -6,9 +20,13 @@ services:
     # The bot may use a Telegram proxy bound to 127.0.0.1 on the Raspberry Pi host.
     network_mode: host
     command: ["serve"]
+    depends_on:
+      redis:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_PATH: /app/data/tg-net-bot.sqlite
+      REDIS_ADDR: 127.0.0.1:6379
     volumes:
       - ./data:/app/data
     # ICMP checks need raw sockets. TCP and HTTP checks work without this capability.

@@ -27,6 +27,9 @@ func New(provider PrimaryChecker, cache Cache, ttl time.Duration) (*Service, err
 	if provider == nil {
 		return nil, fmt.Errorf("block check provider is required")
 	}
+	if cache == nil {
+		return nil, fmt.Errorf("block check cache is required")
+	}
 	if ttl <= 0 {
 		return nil, fmt.Errorf("block check cache ttl must be positive")
 	}
@@ -124,9 +127,6 @@ func (s *Service) Probe(ctx context.Context, key string) (ProbeResult, error) {
 }
 
 func (s *Service) ProbeWithEvents(ctx context.Context, key string, emit func(ProbeResult)) (ProbeResult, error) {
-	if s.cache == nil {
-		return ProbeResult{}, fmt.Errorf("extended check cache is not configured")
-	}
 	result, err := s.cache.Get(ctx, key)
 	if err != nil {
 		return ProbeResult{}, err

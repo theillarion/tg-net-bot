@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -19,6 +20,12 @@ import (
 func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	return serve(ctx, cfg, logger, func(ctx context.Context, path string) (appState, error) {
 		return storage.Open(ctx, path)
+	}, func(ctx context.Context, address, password string) (blockcheck.Cache, io.Closer, error) {
+		cache, err := storage.OpenRedisCache(ctx, address, password)
+		if err != nil {
+			return nil, nil, err
+		}
+		return cache, cache, nil
 	}, telegram.NewAPI, runTelegramBot)
 }
 
@@ -29,12 +36,13 @@ type appState interface {
 }
 
 type botRunner func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger, telegram.InteractionStore) error
+type cacheOpener func(context.Context, string, string) (blockcheck.Cache, io.Closer, error)
 
 func runTelegramBot(ctx context.Context, api *telegram.API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger, store telegram.InteractionStore) error {
 	return telegram.NewBot(api, service, allowed, logger, store).Run(ctx)
 }
 
-func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open func(context.Context, string) (appState, error), newAPI func(string, string) (*telegram.API, error), runBot botRunner) error {
+func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open func(context.Context, string) (appState, error), openCache cacheOpener, newAPI func(string, string) (*telegram.API, error), runBot botRunner) error {
 	state, err := open(ctx, cfg.DatabasePath)
 	if err != nil {
 		return fmt.Errorf("open application database: %w", err)
@@ -45,10 +53,15 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open fun
 		}
 	}()
 	network := checker.New()
-	var blockCache blockcheck.Cache
-	if cache, ok := state.(blockcheck.Cache); ok {
-		blockCache = cache
+	blockCache, cacheCloser, err := openCache(ctx, cfg.RedisAddr, cfg.RedisPassword)
+	if err != nil {
+		return fmt.Errorf("open block check Redis cache: %w", err)
 	}
+	defer func() {
+		if err := cacheCloser.Close(); err != nil && logger != nil {
+			logger.Error("close block check Redis cache", "error", err)
+		}
+	}()
 	cacheTTL := cfg.BlockCheckCacheTTL
 	if cacheTTL <= 0 {
 		cacheTTL = 3 * time.Hour

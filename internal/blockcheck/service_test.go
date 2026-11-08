@@ -104,6 +104,9 @@ func (c *fakeCache) Get(_ context.Context, key string) (Result, error) {
 
 func serviceForTest(t *testing.T, provider PrimaryChecker, cache Cache, ttl time.Duration) *Service {
 	t.Helper()
+	if cache == nil {
+		cache = newFakeCache()
+	}
 	service, err := New(provider, cache, ttl)
 	if err != nil {
 		t.Fatal(err)
@@ -285,6 +288,9 @@ func TestServiceValidatesInputsAndPropagatesPrimaryFailures(t *testing.T) {
 	provider := &fakeProvider{errors: []error{errors.New("upstream offline")}}
 	if _, err := New(provider, nil, 0); err == nil {
 		t.Fatal("non-positive cache ttl was accepted")
+	}
+	if _, err := New(provider, nil, time.Hour); err == nil {
+		t.Fatal("nil cache was accepted")
 	}
 	service := serviceForTest(t, provider, nil, time.Hour)
 	if _, err := service.Check(context.Background(), "bad/path"); err == nil {
