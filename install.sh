@@ -62,15 +62,17 @@ if [ "$configure_env" = yes ]; then
   } > .env
 fi
 mkdir -p data
-if docker container inspect tg-net-bot >/dev/null 2>&1; then
-  printf 'An existing container named tg-net-bot is running. Remove it before starting this installation? [y/N] '
-  if ! IFS= read -r answer; then
-    answer=
+for existing_name in tg-net-bot tg-net-tools-bot; do
+  if docker container inspect "$existing_name" >/dev/null 2>&1; then
+    printf 'An existing container named %s is running. Remove it before starting this installation? [y/N] ' "$existing_name"
+    if ! IFS= read -r answer; then
+      answer=
+    fi
+    case "$answer" in
+      y|Y|yes|YES) docker rm -f "$existing_name" ;;
+      *) echo "Existing container kept; installation cancelled." >&2; exit 1 ;;
+    esac
   fi
-  case "$answer" in
-    y|Y|yes|YES) docker rm -f tg-net-bot ;;
-    *) echo "Existing container kept; installation cancelled." >&2; exit 1 ;;
-  esac
-fi
+done
 docker compose up -d --build
 echo "Bot is running. Open Telegram and send /start to the bot."

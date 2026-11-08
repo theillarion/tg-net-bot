@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+    container_name: tg-net-tools-bot
     restart: unless-stopped
     command: ["serve"]
     env_file: .env
