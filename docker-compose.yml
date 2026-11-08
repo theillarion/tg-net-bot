@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: tg-net-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/tg-net-bot.sqlite
+    volumes:
+      - ./data:/app/data
+    # ICMP checks need raw sockets. TCP and HTTP checks work without this capability.
+    cap_add:
+      - NET_RAW

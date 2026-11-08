@@ -1,0 +1,5 @@
+.env
+data/
+*.log
+/tg-net-bot
+/bin/
