@@ -102,9 +102,9 @@ func (s *Service) Check(ctx context.Context, host string, method Method, argumen
 		}
 		return true, "ICMP reply received"
 	case TCP:
-		address := net.JoinHostPort(strings.Trim(host, "[]"), argument)
+		endpoint := net.JoinHostPort(strings.Trim(host, "[]"), argument)
 		d := net.Dialer{Timeout: 5 * time.Second}
-		conn, err := d.DialContext(ctx, "tcp", address)
+		conn, err := d.DialContext(ctx, "tcp", endpoint)
 		if err != nil {
 			return false, err.Error()
 		}

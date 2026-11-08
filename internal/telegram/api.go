@@ -12,8 +12,9 @@ import (
 )
 
 type API struct {
-	token  string
-	client *http.Client
+	token   string
+	client  *http.Client
+	baseURL string
 }
 
 func NewAPI(token, proxy string) (*API, error) {
@@ -25,14 +26,18 @@ func NewAPI(token, proxy string) (*API, error) {
 		}
 		transport.Proxy = http.ProxyURL(u)
 	}
-	return &API{token: token, client: &http.Client{Transport: transport, Timeout: 70 * time.Second}}, nil
+	return &API{token: token, client: &http.Client{Transport: transport, Timeout: 70 * time.Second}, baseURL: "https://api.telegram.org"}, nil
 }
 func (a *API) Call(ctx context.Context, method string, payload any, result any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode Telegram request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+a.token+"/"+method, bytes.NewReader(data))
+	baseURL := a.baseURL
+	if baseURL == "" {
+		baseURL = "https://api.telegram.org"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/bot"+a.token+"/"+method, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("create Telegram request: %w", err)
 	}

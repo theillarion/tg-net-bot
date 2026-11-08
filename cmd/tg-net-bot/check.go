@@ -13,12 +13,12 @@ import (
 func newCheckCommand() *cobra.Command {
 	var method, argument string
 	cmd := &cobra.Command{
-		Use:   "check [flags] <IP-or-domain>",
+		Use:   "check [flags] <server>",
 		Short: "Run a one-time availability check",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !checker.ValidHost(args[0]) {
-				return fmt.Errorf("invalid IP address or domain: %q", args[0])
+				return fmt.Errorf("invalid server %q: expected an IP or domain", args[0])
 			}
 			m, arg, err := checker.Parse(method, argument)
 			if err != nil {

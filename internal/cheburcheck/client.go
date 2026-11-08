@@ -12,12 +12,17 @@ import (
 	"time"
 )
 
-type Client struct{ httpClient *http.Client }
+type Client struct {
+	httpClient *http.Client
+	baseURL    string
+}
 
-func New() *Client { return &Client{httpClient: &http.Client{Timeout: 90 * time.Second}} }
+func New() *Client {
+	return &Client{httpClient: &http.Client{Timeout: 90 * time.Second}, baseURL: "https://cheburcheck.ru"}
+}
 
 func (c *Client) Check(ctx context.Context, target string) (string, error) {
-	endpoint := "https://cheburcheck.ru/api/v1/check?target=" + url.QueryEscape(target)
+	endpoint := strings.TrimRight(c.baseURL, "/") + "/api/v1/check?target=" + url.QueryEscape(target)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("create cheburcheck request: %w", err)
@@ -62,7 +67,7 @@ func (c *Client) Check(ctx context.Context, target string) (string, error) {
 		}
 		return compact(string(body)), nil
 	}
-	probeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://cheburcheck.ru/api/v1/probe/"+url.PathEscape(id), nil)
+	probeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.baseURL, "/")+"/api/v1/probe/"+url.PathEscape(id), nil)
 	if err != nil {
 		return "", fmt.Errorf("create cheburcheck probe request: %w", err)
 	}

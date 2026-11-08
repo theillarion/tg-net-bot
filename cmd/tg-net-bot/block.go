@@ -12,17 +12,21 @@ import (
 )
 
 func newBlockCommand() *cobra.Command {
+	return newBlockCommandWith(func(ctx context.Context, host string) (string, error) { return cheburcheck.New().Check(ctx, host) })
+}
+
+func newBlockCommandWith(check func(context.Context, string) (string, error)) *cobra.Command {
 	return &cobra.Command{
-		Use:   "block <IP-or-domain>",
-		Short: "Query Cheburcheck for an address",
+		Use:   "block <server>",
+		Short: "Query Cheburcheck for a server",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !checker.ValidHost(args[0]) {
-				return fmt.Errorf("invalid IP address or domain: %q", args[0])
+				return fmt.Errorf("invalid server %q: expected an IP or domain", args[0])
 			}
 			ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
 			defer cancel()
-			result, err := cheburcheck.New().Check(ctx, args[0])
+			result, err := check(ctx, args[0])
 			if err != nil {
 				return err
 			}

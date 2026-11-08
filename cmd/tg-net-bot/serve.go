@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,13 +14,17 @@ import (
 )
 
 func newServeCommand() *cobra.Command {
+	return newServeCommandWith(config.Load, app.Serve)
+}
+
+func newServeCommandWith(load func() (config.Config, error), run func(context.Context, config.Config, *slog.Logger) error) *cobra.Command {
 	var databasePath string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the Telegram bot and alert scheduler",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load()
+			cfg, err := load()
 			if err != nil {
 				return err
 			}
@@ -29,7 +34,7 @@ func newServeCommand() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-			if err := app.Serve(ctx, cfg, logger); err != nil {
+			if err := run(ctx, cfg, logger); err != nil {
 				return fmt.Errorf("serve bot: %w", err)
 			}
 			return nil

@@ -3,3 +3,7 @@ data/
 *.log
 /tg-net-bot
 /bin/
+
+/coverage.out
+
+/.agents-cache/

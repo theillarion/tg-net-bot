@@ -2,7 +2,7 @@
 set -eu
 
 REPO_URL=${REPO_URL:-https://github.com/theillarion/tg-net-bot.git}
-INSTALL_DIR=${INSTALL_DIR:-tg-net-bot}
+INSTALL_DIR=${INSTALL_DIR:-.}
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required. Install Docker Engine and the Compose plugin first." >&2

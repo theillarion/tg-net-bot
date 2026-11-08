@@ -232,10 +232,10 @@ func (b *Bot) handleMenuButton(ctx context.Context, chatID, userID int64, input 
 	switch input {
 	case buttonCheck:
 		b.setPending(userID, interaction{Step: "check-target"})
-		b.send(ctx, chatID, "Отправь IP, домен или имя сохранённого сервера для проверки доступности.")
+		b.send(ctx, chatID, "Укажи сервер по IP, домену или имени сохранённого сервера для проверки доступности.")
 	case buttonBlock:
 		b.setPending(userID, interaction{Step: "block-target"})
-		b.send(ctx, chatID, "Отправь IP, домен или имя сохранённого сервера для проверки в Cheburcheck.")
+		b.send(ctx, chatID, "Укажи сервер по IP, домену или имени сохранённого сервера для проверки в Cheburcheck.")
 	case buttonAdd:
 		b.setPending(userID, interaction{Step: "add-name"})
 		b.send(ctx, chatID, "Как назвать сервер?")
@@ -263,7 +263,7 @@ func (b *Bot) handlePending(ctx context.Context, chatID, userID int64, pending i
 		}
 		pending.Name, pending.Step = value, "add-host"
 		b.setPending(userID, pending)
-		b.send(ctx, chatID, "Теперь отправь IP-адрес или домен сервера.")
+		b.send(ctx, chatID, "Теперь укажи сервер: IP или домен.")
 	case "add-host":
 		b.addTarget(ctx, chatID, userID, pending.Name, value)
 	case "check-target":
@@ -524,7 +524,7 @@ func (b *Bot) chooseAlertTarget(ctx context.Context, chatID, userID int64) {
 }
 func (b *Bot) manualCheckCommand(ctx context.Context, chatID, userID int64, args []string) {
 	if len(args) < 1 || len(args) > 3 {
-		b.send(ctx, chatID, "Использование: /check <IP/домен или имя> [icmp|tcp|http] [порт/URL]")
+		b.send(ctx, chatID, "Использование: /check <сервер: IP, домен или имя> [icmp|tcp|http] [порт/URL]")
 		return
 	}
 	target := b.resolveTarget(userID, args[0])
@@ -555,7 +555,7 @@ func (b *Bot) runManualCheck(ctx context.Context, chatID int64, host, method, ar
 }
 func (b *Bot) manualBlockCommand(ctx context.Context, chatID, userID int64, args []string) {
 	if len(args) != 1 {
-		b.send(ctx, chatID, "Использование: /block <IP/домен или имя>")
+		b.send(ctx, chatID, "Использование: /block <сервер: IP, домен или имя>")
 		return
 	}
 	target := b.resolveTarget(userID, args[0])

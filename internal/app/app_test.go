@@ -1,0 +1,71 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"github.com/theillarion/tg-net-bot/internal/config"
+	"github.com/theillarion/tg-net-bot/internal/domain"
+	"github.com/theillarion/tg-net-bot/internal/monitor"
+	"github.com/theillarion/tg-net-bot/internal/storage"
+	"github.com/theillarion/tg-net-bot/internal/telegram"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestServeCanceled(t *testing.T) {
+	cfg := config.Config{DatabasePath: filepath.Join(t.TempDir(), "state.db"), Token: "test", AllowedUsers: map[int64]struct{}{1: {}}}
+	err := serve(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), func(ctx context.Context, path string) (appState, error) { return storage.Open(ctx, path) }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+		return context.Canceled
+	})
+	if err != nil {
+		t.Fatalf("Serve with graceful cancellation: %v", err)
+	}
+}
+func TestServeInvalidProxy(t *testing.T) {
+	err := Serve(context.Background(), config.Config{DatabasePath: filepath.Join(t.TempDir(), "state.db"), Token: "test", Proxy: "://bad", AllowedUsers: map[int64]struct{}{1: {}}}, nil)
+	if err == nil {
+		t.Fatal("expected proxy initialization error")
+	}
+}
+
+type failingLoadState struct{ closeErr error }
+
+func (f failingLoadState) Load(context.Context) (domain.State, error) {
+	return domain.State{}, errors.New("load failed")
+}
+func (f failingLoadState) InsertTarget(context.Context, int64, domain.Target) error   { return nil }
+func (f failingLoadState) DeleteTarget(context.Context, int64, string) error          { return nil }
+func (f failingLoadState) InsertAlert(context.Context, domain.Alert) error            { return nil }
+func (f failingLoadState) DeleteAlert(context.Context, int64, string) error           { return nil }
+func (f failingLoadState) SetAlertLastCheck(context.Context, string, time.Time) error { return nil }
+func (f failingLoadState) SetAlertLastUp(context.Context, string, bool) error         { return nil }
+func (f failingLoadState) Close() error                                               { return f.closeErr }
+func TestServeDependencyFailures(t *testing.T) {
+	cfg := config.Config{DatabasePath: "x", Token: "x", AllowedUsers: map[int64]struct{}{1: {}}}
+	if err := serve(context.Background(), cfg, nil, func(context.Context, string) (appState, error) { return nil, errors.New("open failed") }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "open application database") {
+		t.Fatalf("open error=%v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	err := serve(context.Background(), cfg, logger, func(context.Context, string) (appState, error) {
+		return failingLoadState{closeErr: errors.New("close failed")}, nil
+	}, func(string, string) (*telegram.API, error) { return &telegram.API{}, nil }, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "initialize monitor") {
+		t.Fatalf("monitor error=%v", err)
+	}
+}
+
+func TestRunTelegramBotHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runTelegramBot(ctx, &telegram.API{}, nil, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runTelegramBot error=%v", err)
+	}
+}

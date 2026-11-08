@@ -63,22 +63,29 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 	if err = db.PingContext(ctx); err != nil {
 		return nil, errors.Join(fmt.Errorf("connect to SQLite database: %w", err), db.Close())
 	}
+	if err = initializeSchema(ctx, db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	return &SQLite{db: db}, nil
+}
+
+func initializeSchema(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("begin SQLite schema initialization: %w", err), db.Close())
+		return fmt.Errorf("begin SQLite schema initialization: %w", err)
 	}
 	for _, statement := range strings.Split(schema, ";") {
 		if strings.TrimSpace(statement) == "" {
 			continue
 		}
 		if _, err = tx.ExecContext(ctx, statement); err != nil {
-			return nil, errors.Join(fmt.Errorf("initialize SQLite schema: %w", err), tx.Rollback(), db.Close())
+			return errors.Join(fmt.Errorf("initialize SQLite schema: %w", err), tx.Rollback())
 		}
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, errors.Join(fmt.Errorf("commit SQLite schema initialization: %w", err), db.Close())
+		return fmt.Errorf("commit SQLite schema initialization: %w", err)
 	}
-	return &SQLite{db: db}, nil
+	return nil
 }
 
 func (s *SQLite) Close() error {

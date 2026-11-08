@@ -15,18 +15,35 @@ import (
 )
 
 func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
-	state, err := storage.Open(ctx, cfg.DatabasePath)
+	return serve(ctx, cfg, logger, func(ctx context.Context, path string) (appState, error) {
+		return storage.Open(ctx, path)
+	}, telegram.NewAPI, runTelegramBot)
+}
+
+type appState interface {
+	monitor.Repository
+	Close() error
+}
+
+type botRunner func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error
+
+func runTelegramBot(ctx context.Context, api *telegram.API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger) error {
+	return telegram.NewBot(api, service, allowed, logger).Run(ctx)
+}
+
+func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open func(context.Context, string) (appState, error), newAPI func(string, string) (*telegram.API, error), runBot botRunner) error {
+	state, err := open(ctx, cfg.DatabasePath)
 	if err != nil {
 		return fmt.Errorf("open application database: %w", err)
 	}
 	defer func() {
-		if err := state.Close(); err != nil {
+		if err := state.Close(); err != nil && logger != nil {
 			logger.Error("close application database", "error", err)
 		}
 	}()
 	network := checker.New()
 	blocks := cheburcheck.New()
-	api, err := telegram.NewAPI(cfg.Token, cfg.Proxy)
+	api, err := newAPI(cfg.Token, cfg.Proxy)
 	if err != nil {
 		return fmt.Errorf("initialize Telegram API: %w", err)
 	}
@@ -34,9 +51,8 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("initialize monitor: %w", err)
 	}
-	bot := telegram.NewBot(api, service, cfg.AllowedUsers, logger)
 	go service.Run(ctx)
-	if err = bot.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err = runBot(ctx, api, service, cfg.AllowedUsers, logger); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("run Telegram bot: %w", err)
 	}
 	return nil

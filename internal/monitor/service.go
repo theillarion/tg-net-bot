@@ -55,7 +55,7 @@ func New(ctx context.Context, repo Repository, network NetworkChecker, block Blo
 func userKey(user int64) string { return strconv.FormatInt(user, 10) }
 func (s *Service) Check(ctx context.Context, host, method, argument string) (domain.CheckResult, error) {
 	if !checker.ValidHost(host) {
-		return domain.CheckResult{}, fmt.Errorf("invalid IP address or domain")
+		return domain.CheckResult{}, fmt.Errorf("invalid server: expected an IP or domain")
 	}
 	m, arg, err := checker.Parse(method, argument)
 	if err != nil {
@@ -66,13 +66,13 @@ func (s *Service) Check(ctx context.Context, host, method, argument string) (dom
 }
 func (s *Service) Block(ctx context.Context, host string) (string, error) {
 	if !checker.ValidHost(host) {
-		return "", fmt.Errorf("invalid IP address or domain")
+		return "", fmt.Errorf("invalid server: expected an IP or domain")
 	}
 	return s.block.Check(ctx, host)
 }
 func (s *Service) AddTarget(ctx context.Context, user int64, name, host string) error {
 	if strings.TrimSpace(name) == "" || !checker.ValidHost(host) {
-		return fmt.Errorf("target needs a name and valid IP address or domain")
+		return fmt.Errorf("server needs a name and a valid IP or domain")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

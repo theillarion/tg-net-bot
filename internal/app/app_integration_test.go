@@ -1,0 +1,90 @@
+//go:build integration
+
+package app
+
+import (
+	"context"
+	"github.com/theillarion/tg-net-bot/internal/checker"
+	"github.com/theillarion/tg-net-bot/internal/domain"
+	"github.com/theillarion/tg-net-bot/internal/monitor"
+	"github.com/theillarion/tg-net-bot/internal/storage"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+type integrationNetwork struct{}
+
+func (integrationNetwork) Check(context.Context, string, checker.Method, string) (bool, string) {
+	return true, "reachable"
+}
+
+type integrationBlock struct{}
+
+func (integrationBlock) Check(context.Context, string) (string, error) { return "not listed", nil }
+
+type integrationNotifier struct{}
+
+func (integrationNotifier) Send(context.Context, int64, string) error { return nil }
+func TestSQLiteMonitorIntegration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "data", "bot.sqlite")
+	repo, err := storage.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := monitor.New(ctx, repo, integrationNetwork{}, integrationBlock{}, integrationNotifier{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = svc.AddTarget(ctx, 22, "edge", "2001:db8::5"); err != nil {
+		t.Fatal(err)
+	}
+	alert, err := svc.AddAlert(ctx, 22, 22, "edge", "tcp", "443", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alert.Interval != time.Minute || alert.Method != "tcp" || alert.Argument != "443" {
+		t.Fatalf("created alert: %+v", alert)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { svc.Run(runCtx); close(done) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		state, loadErr := repo.Load(ctx)
+		if loadErr != nil {
+			cancel()
+			<-done
+			t.Fatal(loadErr)
+		}
+		if len(state.Alerts) == 1 && state.Alerts[0].LastUp != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("scheduled alert did not persist a result")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if err = repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := storage.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	state, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Targets["22"]) != 1 || len(state.Alerts) != 1 || state.Alerts[0].Target != (domain.Target{Name: "edge", Host: "2001:db8::5"}) || state.Alerts[0].LastUp == nil || !*state.Alerts[0].LastUp || state.Alerts[0].LastCheck.IsZero() {
+		t.Fatalf("persisted state %#v", state)
+	}
+}

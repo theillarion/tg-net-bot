@@ -3,6 +3,7 @@ services:
     build: .
     container_name: tg-net-bot
     restart: unless-stopped
+    command: ["serve"]
     env_file: .env
     environment:
       DATABASE_PATH: /app/data/tg-net-bot.sqlite
