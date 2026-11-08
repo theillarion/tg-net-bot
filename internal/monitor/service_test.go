@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/checker"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	"io"
@@ -75,14 +76,32 @@ func (n *fakeNetwork) Check(context.Context, string, checker.Method, string) (bo
 }
 
 type fakeBlock struct {
-	verdict string
-	err     error
-	calls   int
+	verdict    string
+	err        error
+	calls      int
+	probe      blockcheck.ProbeResult
+	probeErr   error
+	probeCalls int
 }
 
-func (b *fakeBlock) Check(context.Context, string) (string, error) {
+func (b *fakeBlock) Check(_ context.Context, target string) (blockcheck.Result, error) {
 	b.calls++
-	return b.verdict, b.err
+	return blockcheck.Result{Target: target, Blocked: b.verdict != "clear"}, b.err
+}
+func (b *fakeBlock) Probe(context.Context, string) (blockcheck.ProbeResult, error) {
+	b.probeCalls++
+	return b.probe, b.probeErr
+}
+func (b *fakeBlock) CheckBatch(ctx context.Context, targets []string, emit func(blockcheck.BatchItem)) error {
+	for _, target := range targets {
+		result, err := b.Check(ctx, target)
+		item := blockcheck.BatchItem{Target: target, Result: result, Status: "complete"}
+		if err != nil {
+			item.Status, item.Error = "failed", err.Error()
+		}
+		emit(item)
+	}
+	return nil
 }
 
 type fakeNotifier struct {
@@ -94,7 +113,7 @@ func (n *fakeNotifier) Send(_ context.Context, _ int64, s string) error {
 	n.messages = append(n.messages, s)
 	return n.err
 }
-func newTestService(t *testing.T, r *fakeRepo, n *fakeNetwork, b *fakeBlock, no *fakeNotifier) *Service {
+func newTestService(t *testing.T, r *fakeRepo, n *fakeNetwork, b BlockChecker, no *fakeNotifier) *Service {
 	t.Helper()
 	s, e := New(context.Background(), r, n, b, no, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if e != nil {
@@ -124,8 +143,60 @@ func TestNewAndCheckBlock(t *testing.T) {
 		t.Fatal("invalid block target accepted")
 	}
 	v, err := s.Block(context.Background(), "example.com")
-	if err != nil || v != "clear" || b.calls != 1 {
-		t.Fatalf("block: %s %v", v, err)
+	if err != nil || v.Blocked || b.calls != 1 {
+		t.Fatalf("block: %+v %v", v, err)
+	}
+}
+
+func TestNewUsesDefaultLoggerWhenNoneProvided(t *testing.T) {
+	service, err := New(context.Background(), &fakeRepo{state: domain.EmptyState()}, &fakeNetwork{}, &fakeBlock{}, &fakeNotifier{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.logger == nil {
+		t.Fatal("default logger was not initialized")
+	}
+}
+
+type streamingBlock struct {
+	*fakeBlock
+	progress blockcheck.ProbeResult
+}
+
+func (b *streamingBlock) ProbeWithEvents(_ context.Context, _ string, emit func(blockcheck.ProbeResult)) (blockcheck.ProbeResult, error) {
+	emit(b.progress)
+	return b.probe, b.probeErr
+}
+
+func TestBlockProbeAndBatchExposeProviderResults(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeBlock{probe: blockcheck.ProbeResult{Target: "edge.example"}}
+	s := newTestService(t, &fakeRepo{state: domain.EmptyState()}, &fakeNetwork{}, provider, &fakeNotifier{})
+	var updates []blockcheck.ProbeResult
+	got, err := s.BlockProbeWithEvents(ctx, "cache-key", func(update blockcheck.ProbeResult) { updates = append(updates, update) })
+	if err != nil || got.Target != "edge.example" || len(updates) != 1 || provider.probeCalls != 1 {
+		t.Fatalf("probe=%+v updates=%+v calls=%d err=%v", got, updates, provider.probeCalls, err)
+	}
+	var items []blockcheck.BatchItem
+	if err := s.BlockBatch(ctx, []string{"edge.example"}, func(item blockcheck.BatchItem) { items = append(items, item) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Target != "edge.example" || provider.calls != 1 {
+		t.Fatalf("batch=%+v calls=%d", items, provider.calls)
+	}
+	provider.probeErr = errors.New("upstream offline")
+	if _, err := s.BlockProbe(ctx, "cache-key"); err == nil || !errors.Is(err, provider.probeErr) {
+		t.Fatalf("probe failure=%v", err)
+	}
+}
+
+func TestBlockProbeUsesStreamingProviderWhenAvailable(t *testing.T) {
+	provider := &streamingBlock{fakeBlock: &fakeBlock{probe: blockcheck.ProbeResult{Target: "done"}}, progress: blockcheck.ProbeResult{Target: "progress"}}
+	s := newTestService(t, &fakeRepo{state: domain.EmptyState()}, &fakeNetwork{}, provider, &fakeNotifier{})
+	var updates []blockcheck.ProbeResult
+	got, err := s.BlockProbeWithEvents(context.Background(), "key", func(update blockcheck.ProbeResult) { updates = append(updates, update) })
+	if err != nil || got.Target != "done" || len(updates) != 1 || updates[0].Target != "progress" {
+		t.Fatalf("probe=%+v updates=%+v err=%v", got, updates, err)
 	}
 }
 func TestTargetsAlertsCRUD(t *testing.T) {

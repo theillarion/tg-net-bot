@@ -3,11 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 )
 
@@ -34,6 +36,10 @@ func TestSQLiteUnavailableDatabase(t *testing.T) {
 		{"load interactions", func() error { _, err := db.LoadInteractions(ctx); return err }},
 		{"save interaction", func() error { return db.SaveInteraction(ctx, 1, domain.Interaction{Step: "add-name"}) }},
 		{"delete interaction", func() error { return db.DeleteInteraction(ctx, 1) }},
+		{"save block cache", func() error {
+			return db.Save(ctx, "key", blockcheck.Result{Geo: json.RawMessage(`{"country":"RU"}`)}, time.Now().Add(time.Hour))
+		}},
+		{"get block cache", func() error { _, err := db.Get(ctx, "key"); return err }},
 	}
 	for _, op := range operations {
 		t.Run(op.name, func(t *testing.T) {

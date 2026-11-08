@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/checker"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	"github.com/theillarion/tg-net-bot/internal/monitor"
@@ -581,6 +583,8 @@ func (b *Bot) handleCallback(ctx context.Context, callback CallbackQuery) {
 		b.askAlertInterval(ctx, chatID, callback.From.ID, pending)
 	case "target-check", "target-block", "target-alert", "target-remove":
 		b.handleTargetAction(ctx, chatID, callback.From.ID, parts[0], at(parts, 1))
+	case "block-probe":
+		b.startBlockProbe(ctx, chatID, at(parts, 1))
 	case "alert-remove":
 		if err := b.service.RemoveAlert(ctx, callback.From.ID, at(parts, 1)); err != nil {
 			b.send(ctx, chatID, "Не удалось удалить алерт: "+err.Error())
@@ -1197,6 +1201,7 @@ func (b *Bot) targetsByName(userID int64, names []string) []domain.Target {
 type operationResult struct {
 	target         domain.Target
 	status, detail string
+	cacheKey       string
 }
 
 func (b *Bot) startOperation(parent context.Context, chatID int64, action string, targets []domain.Target, method, argument string) {
@@ -1229,26 +1234,61 @@ func (b *Bot) startOperation(parent context.Context, chatID int64, action string
 			b.uiMu.Unlock()
 		}()
 		results := make([]operationResult, 0, len(targets))
+		if action == "block" {
+			hosts := make([]string, 0, len(targets))
+			for _, target := range targets {
+				hosts = append(hosts, target.Host)
+			}
+			position := 0
+			err := b.service.BlockBatch(ctx, hosts, func(item blockcheck.BatchItem) {
+				if position >= len(targets) {
+					return
+				}
+				target := targets[position]
+				position++
+				status := item.Status
+				switch status {
+				case "complete":
+					status = "база проверена"
+				case "limited":
+					status = "лимит запросов"
+				case "skipped":
+					status = "пропущено из-за лимита"
+				case "failed":
+					status = "ошибка"
+				case "canceled":
+					status = "отменено"
+				}
+				detail, cacheKey := html.EscapeString(item.Error), ""
+				if item.Result.Target != "" {
+					detail = formatBlockResult(item.Result)
+					cacheKey = item.Result.CacheKey
+					if item.Error != "" {
+						status = "база проверена · кеш недоступен"
+					}
+				}
+				results = append(results, operationResult{target: target, status: status, detail: detail, cacheKey: cacheKey})
+				progress := formatOperationResults(action, results, position, len(targets))
+				if position < len(targets) && item.Status != "limited" {
+					progress += fmt.Sprintf("\n\nПроверяю %s · %d / %d…", html.EscapeString(targets[position].Name), position+1, len(targets))
+				}
+				b.render(ctx, chatID, progress, blockResultsKeyboard(results))
+			})
+			if err != nil && ctx.Err() == nil {
+				b.render(ctx, chatID, "Пакетная проверка остановлена: "+html.EscapeString(err.Error()), blockResultsKeyboard(results))
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			b.render(ctx, chatID, formatOperationResults("block", results, len(results), len(targets)), blockResultsKeyboard(results))
+			return
+		}
 		for i, target := range targets {
 			if ctx.Err() != nil {
 				return
 			}
-			verb := "Проверяю доступность"
-			if action == "block" {
-				verb = "Запрашиваю проверку блокировки"
-			}
-			b.render(ctx, chatID, fmt.Sprintf("<b>%s</b>\n%d / %d · %s\n\nЗапрос выполняется…", verb, i+1, len(targets), html.EscapeString(target.Name)), navigationKeyboard("nav:home"))
-			if action == "block" {
-				checkCtx, stop := context.WithTimeout(ctx, 90*time.Second)
-				value, err := b.service.Block(checkCtx, target.Host)
-				stop()
-				if err != nil {
-					results = append(results, operationResult{target: target, status: "ошибка", detail: err.Error()})
-				} else {
-					results = append(results, operationResult{target: target, status: "готово", detail: value})
-				}
-				continue
-			}
+			b.render(ctx, chatID, fmt.Sprintf("<b>Проверяю доступность</b>\n%d / %d · %s\n\nЗапрос выполняется…", i+1, len(targets), html.EscapeString(target.Name)), navigationKeyboard("nav:home"))
 			checkCtx, stop := context.WithTimeout(ctx, 15*time.Second)
 			value, err := b.service.Check(checkCtx, target.Host, method, argument)
 			stop()
@@ -1447,15 +1487,39 @@ func (b *Bot) manualBlockCommand(ctx context.Context, chatID, userID int64, args
 	b.manualBlock(ctx, chatID, target)
 }
 func (b *Bot) manualBlock(ctx context.Context, chatID int64, target string) {
-	b.send(ctx, chatID, "Проверяю через Cheburcheck: "+target+"...")
+	b.render(ctx, chatID, "Проверяю базовые списки Cheburcheck… Расширенный probe автоматически не запускается. Лимиты источника: по текущим default — 30 базовых запросов/мин и 5 probe/мин, burst 1; развёртывание может отличаться.", navigationKeyboard("nav:home"))
 	checkCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	result, err := b.service.Block(checkCtx, target)
 	if err != nil {
-		b.send(ctx, chatID, "Проверка не завершилась: "+err.Error())
+		b.render(ctx, chatID, "Проверка не завершилась: "+html.EscapeString(err.Error()), navigationKeyboard("menu:services"))
 		return
 	}
-	b.send(ctx, chatID, fmt.Sprintf("Cheburcheck для %s: %s", target, result))
+	b.render(ctx, chatID, formatBlockResult(result), blockResultsKeyboard([]operationResult{{target: domain.Target{Name: target, Host: target}, status: "база проверена", cacheKey: result.CacheKey}}))
+}
+
+func (b *Bot) startBlockProbe(parent context.Context, chatID int64, cacheKey string) {
+	if cacheKey == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
+	b.render(ctx, chatID, "Запрашиваю расширенный Cheburcheck probe. Лимит источника по текущему default — 5 запросов/мин, burst 1; настройки развёртывания могут отличаться.", navigationKeyboard("menu:services"))
+	go func() {
+		defer cancel()
+		result, err := b.service.BlockProbeWithEvents(ctx, cacheKey, func(progress blockcheck.ProbeResult) {
+			b.render(ctx, chatID, formatProbeProgress(progress), navigationKeyboard("menu:services"))
+		})
+		if err != nil {
+			var limited *blockcheck.RateLimitError
+			if errors.As(err, &limited) {
+				b.render(ctx, chatID, "Ограничение запросов: "+html.EscapeString(err.Error())+". Базовый результат сохранён; probe не завершён.", navigationKeyboard("menu:services"))
+				return
+			}
+			b.render(ctx, chatID, "Расширенная проверка не завершилась: "+html.EscapeString(err.Error()), navigationKeyboard("menu:services"))
+			return
+		}
+		b.render(ctx, chatID, formatProbeResult(result), navigationKeyboard("menu:services"))
+	}()
 }
 func (b *Bot) addAlertCommand(ctx context.Context, chatID, userID int64, args []string) {
 	if len(args) < 3 || len(args) > 4 {

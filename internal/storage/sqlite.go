@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	_ "modernc.org/sqlite"
 )
@@ -47,6 +49,13 @@ CREATE TABLE IF NOT EXISTS interactions (
     argument TEXT NOT NULL DEFAULT '',
     request_id TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS block_check_cache (
+    cache_key TEXT PRIMARY KEY,
+    target TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    expires_at_ns INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS block_check_cache_expiry_idx ON block_check_cache(expires_at_ns);
 `
 
 func Open(ctx context.Context, path string) (*SQLite, error) {
@@ -119,6 +128,42 @@ func (s *SQLite) Close() error {
 		return fmt.Errorf("close SQLite database: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLite) Save(ctx context.Context, key string, result blockcheck.Result, expiresAt time.Time) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("encode block check cache entry: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, "INSERT INTO block_check_cache(cache_key, target, result_json, expires_at_ns) VALUES(?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET target=excluded.target, result_json=excluded.result_json, expires_at_ns=excluded.expires_at_ns", key, result.Target, string(payload), expiresAt.UnixNano())
+	if err != nil {
+		return fmt.Errorf("save block check cache entry: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, "DELETE FROM block_check_cache WHERE expires_at_ns <= ?", time.Now().UnixNano())
+	if err != nil {
+		return fmt.Errorf("cleanup block check cache: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) Get(ctx context.Context, key string) (blockcheck.Result, error) {
+	var payload string
+	var expiry int64
+	err := s.db.QueryRowContext(ctx, "SELECT result_json, expires_at_ns FROM block_check_cache WHERE cache_key = ?", key).Scan(&payload, &expiry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return blockcheck.Result{}, blockcheck.ErrNotFound
+	}
+	if err != nil {
+		return blockcheck.Result{}, fmt.Errorf("load block check cache entry: %w", err)
+	}
+	if expiry <= time.Now().UnixNano() {
+		return blockcheck.Result{}, blockcheck.ErrExpired
+	}
+	var result blockcheck.Result
+	if err := json.Unmarshal([]byte(payload), &result); err != nil {
+		return blockcheck.Result{}, fmt.Errorf("decode block check cache entry: %w", err)
+	}
+	return result, nil
 }
 
 func (s *SQLite) Load(ctx context.Context) (domain.State, error) {

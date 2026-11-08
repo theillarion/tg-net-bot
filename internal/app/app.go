@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/cheburcheck"
 	"github.com/theillarion/tg-net-bot/internal/checker"
 	"github.com/theillarion/tg-net-bot/internal/config"
@@ -43,12 +45,23 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open fun
 		}
 	}()
 	network := checker.New()
-	blocks := cheburcheck.New()
+	var blockCache blockcheck.Cache
+	if cache, ok := state.(blockcheck.Cache); ok {
+		blockCache = cache
+	}
+	cacheTTL := cfg.BlockCheckCacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = 3 * time.Hour
+	}
+	blockService, err := blockcheck.New(cheburcheck.New(), blockCache, cacheTTL)
+	if err != nil {
+		return fmt.Errorf("initialize block check service: %w", err)
+	}
 	api, err := newAPI(cfg.Token, cfg.Proxy)
 	if err != nil {
 		return fmt.Errorf("initialize Telegram API: %w", err)
 	}
-	service, err := monitor.New(ctx, state, network, blocks, api, logger)
+	service, err := monitor.New(ctx, state, network, blockService, api, logger)
 	if err != nil {
 		return fmt.Errorf("initialize monitor: %w", err)
 	}

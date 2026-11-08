@@ -3,6 +3,9 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	"os"
 	"path/filepath"
@@ -55,6 +58,68 @@ func TestSQLiteLifecycle(t *testing.T) {
 	}
 	if err = db.DeleteTarget(ctx, 42, "missing"); err == nil {
 		t.Fatal("expected missing target error")
+	}
+}
+
+func TestBlockCheckCacheSurvivesRestartAndExpires(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "block-cache.sqlite")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry := time.Now().Add(time.Hour)
+	result := blockcheck.Result{ID: "upstream-id", CacheKey: "short-key", Target: "host.example", ProbeAvailable: true, CheckedAt: time.Now()}
+	if err := db.Save(ctx, result.CacheKey, result, expiry); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := db.Get(ctx, result.CacheKey)
+	if err != nil || got.ID != result.ID || got.Target != result.Target {
+		t.Fatalf("cache result=%+v err=%v", got, err)
+	}
+	if _, err := db.Get(ctx, "missing"); !errors.Is(err, blockcheck.ErrNotFound) {
+		t.Fatalf("missing error=%v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE block_check_cache SET expires_at_ns = ? WHERE cache_key = ?", time.Now().Add(-time.Second).UnixNano(), result.CacheKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get(ctx, result.CacheKey); !errors.Is(err, blockcheck.ErrExpired) {
+		t.Fatalf("expired error=%v", err)
+	}
+}
+
+func TestBlockCheckCacheRejectsMalformedPayloads(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "cache-errors.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Save(ctx, "bad-json", blockcheck.Result{Geo: json.RawMessage("!")}, time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("invalid raw JSON was saved")
+	}
+	if _, err := db.db.ExecContext(ctx, "INSERT INTO block_check_cache(cache_key,target,result_json,expires_at_ns) VALUES(?,?,?,?)", "damaged", "edge.example", "{", time.Now().Add(time.Hour).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get(ctx, "damaged"); err == nil {
+		t.Fatal("malformed cached JSON was accepted")
+	}
+	if _, err := db.db.ExecContext(ctx, "UPDATE block_check_cache SET expires_at_ns = ? WHERE cache_key = ?", time.Now().Add(-time.Second).UnixNano(), "damaged"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Save(ctx, "fresh", blockcheck.Result{Target: "fresh.example"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get(ctx, "damaged"); !errors.Is(err, blockcheck.ErrNotFound) {
+		t.Fatalf("expired cache cleanup did not remove stale entries: %v", err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/checker"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 )
@@ -26,7 +27,9 @@ type NetworkChecker interface {
 	Check(context.Context, string, checker.Method, string) (bool, string)
 }
 type BlockChecker interface {
-	Check(context.Context, string) (string, error)
+	Check(context.Context, string) (blockcheck.Result, error)
+	Probe(context.Context, string) (blockcheck.ProbeResult, error)
+	CheckBatch(context.Context, []string, func(blockcheck.BatchItem)) error
 }
 type Notifier interface {
 	Send(context.Context, int64, string) error
@@ -64,11 +67,32 @@ func (s *Service) Check(ctx context.Context, host, method, argument string) (dom
 	up, detail := s.network.Check(ctx, host, m, arg)
 	return domain.CheckResult{Up: up, Detail: detail}, nil
 }
-func (s *Service) Block(ctx context.Context, host string) (string, error) {
+func (s *Service) Block(ctx context.Context, host string) (blockcheck.Result, error) {
 	if !checker.ValidHost(host) {
-		return "", fmt.Errorf("invalid server: expected an IP or domain")
+		return blockcheck.Result{}, fmt.Errorf("invalid server: expected an IP or domain")
 	}
 	return s.block.Check(ctx, host)
+}
+
+func (s *Service) BlockProbe(ctx context.Context, id string) (blockcheck.ProbeResult, error) {
+	return s.block.Probe(ctx, id)
+}
+
+func (s *Service) BlockProbeWithEvents(ctx context.Context, id string, emit func(blockcheck.ProbeResult)) (blockcheck.ProbeResult, error) {
+	if streamer, ok := s.block.(interface {
+		ProbeWithEvents(context.Context, string, func(blockcheck.ProbeResult)) (blockcheck.ProbeResult, error)
+	}); ok {
+		return streamer.ProbeWithEvents(ctx, id, emit)
+	}
+	result, err := s.block.Probe(ctx, id)
+	if err == nil && emit != nil {
+		emit(result)
+	}
+	return result, err
+}
+
+func (s *Service) BlockBatch(ctx context.Context, targets []string, emit func(blockcheck.BatchItem)) error {
+	return s.block.CheckBatch(ctx, targets, emit)
 }
 func (s *Service) AddTarget(ctx context.Context, user int64, name, host string) error {
 	if strings.TrimSpace(name) == "" || !checker.ValidHost(host) {
@@ -280,10 +304,13 @@ func (s *Service) record(ctx context.Context, alert domain.Alert, up bool, detai
 	blockCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	verdict, err := s.block.Check(blockCtx, alert.Target.Host)
+	blockSummary := "database: not found in blocklists"
 	if err != nil {
-		verdict = "Cheburcheck failed: " + err.Error()
+		blockSummary = "Cheburcheck failed: " + err.Error()
+	} else if verdict.Blocked {
+		blockSummary = "database: listed as blocked"
 	}
-	if err := s.notifier.Send(ctx, alert.ChatID, fmt.Sprintf("🔴 %s is unavailable (%s).\nCheck: %s\nCheburcheck: %s", alert.Target.Name, alert.Method, detail, verdict)); err != nil {
+	if err := s.notifier.Send(ctx, alert.ChatID, fmt.Sprintf("🔴 %s is unavailable (%s).\nCheck: %s\nCheburcheck: %s", alert.Target.Name, alert.Method, detail, blockSummary)); err != nil {
 		s.logger.Error("send unavailable alert", "alert_id", alert.ID, "error", err)
 	}
 }

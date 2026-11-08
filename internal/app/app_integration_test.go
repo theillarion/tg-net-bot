@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 	"github.com/theillarion/tg-net-bot/internal/checker"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	"github.com/theillarion/tg-net-bot/internal/monitor"
@@ -23,7 +24,22 @@ func (integrationNetwork) Check(context.Context, string, checker.Method, string)
 
 type integrationBlock struct{}
 
-func (integrationBlock) Check(context.Context, string) (string, error) { return "not listed", nil }
+func (integrationBlock) Check(_ context.Context, target string) (blockcheck.Result, error) {
+	return blockcheck.Result{Target: target}, nil
+}
+func (integrationBlock) Probe(context.Context, string) (blockcheck.ProbeResult, error) {
+	return blockcheck.ProbeResult{}, nil
+}
+func (b integrationBlock) CheckBatch(ctx context.Context, targets []string, emit func(blockcheck.BatchItem)) error {
+	for _, target := range targets {
+		result, err := b.Check(ctx, target)
+		emit(blockcheck.BatchItem{Target: target, Result: result, Status: "complete"})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type integrationNotifier struct{}
 

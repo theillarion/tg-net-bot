@@ -6,17 +6,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	Token        string
-	AllowedUsers map[int64]struct{}
-	Proxy        string
-	DatabasePath string
+	Token              string
+	AllowedUsers       map[int64]struct{}
+	Proxy              string
+	DatabasePath       string
+	BlockCheckCacheTTL time.Duration
 }
 
 func Load() (Config, error) {
 	c := Config{Token: strings.TrimSpace(os.Getenv("TELEGRAM_TOKEN")), AllowedUsers: make(map[int64]struct{}), Proxy: strings.TrimSpace(os.Getenv("TELEGRAM_PROXY")), DatabasePath: strings.TrimSpace(os.Getenv("DATABASE_PATH"))}
+	cacheTTL := strings.TrimSpace(os.Getenv("BLOCKCHECK_CACHE_TTL"))
+	c.BlockCheckCacheTTL = 3 * time.Hour
+	if cacheTTL != "" {
+		ttl, err := time.ParseDuration(cacheTTL)
+		if err != nil || ttl <= 0 {
+			return Config{}, fmt.Errorf("BLOCKCHECK_CACHE_TTL must be a positive Go duration")
+		}
+		c.BlockCheckCacheTTL = ttl
+	}
 	if c.DatabasePath == "" {
 		c.DatabasePath = "./data/tg-net-bot.sqlite"
 	}

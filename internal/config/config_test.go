@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoad(t *testing.T) {
 	tests := []struct {
@@ -21,6 +24,7 @@ func TestLoad(t *testing.T) {
 			t.Setenv("TALAGRAM_ALLOW_USERS", tt.users)
 			t.Setenv("TELEGRAM_PROXY", tt.proxy)
 			t.Setenv("DATABASE_PATH", tt.db)
+			t.Setenv("BLOCKCHECK_CACHE_TTL", "")
 			got, err := Load()
 			if tt.wantErr != "" {
 				if err == nil || !contains(err.Error(), tt.wantErr) {
@@ -35,6 +39,22 @@ func TestLoad(t *testing.T) {
 				t.Fatalf("Load = %+v", got)
 			}
 		})
+	}
+}
+
+func TestLoadBlockCheckCacheTTL(t *testing.T) {
+	t.Setenv("TELEGRAM_TOKEN", "x")
+	t.Setenv("TALAGRAM_ALLOW_USERS", "1")
+	t.Setenv("TELEGRAM_PROXY", "")
+	t.Setenv("DATABASE_PATH", "")
+	t.Setenv("BLOCKCHECK_CACHE_TTL", "45m")
+	got, err := Load()
+	if err != nil || got.BlockCheckCacheTTL != 45*time.Minute {
+		t.Fatalf("ttl=%s err=%v", got.BlockCheckCacheTTL, err)
+	}
+	t.Setenv("BLOCKCHECK_CACHE_TTL", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("non-positive cache ttl accepted")
 	}
 }
 func contains(s, sub string) bool {

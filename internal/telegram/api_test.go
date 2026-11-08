@@ -79,6 +79,49 @@ func TestNewAPIProxyValidation(t *testing.T) {
 	}
 }
 
+func TestEditScreenUsesMessageIDAndHTMLKeyboard(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if !strings.HasSuffix(r.URL.Path, "/editMessageText") {
+			t.Errorf("method path=%s", r.URL.Path)
+		}
+		var payload struct {
+			ChatID    int64          `json:"chat_id"`
+			MessageID int            `json:"message_id"`
+			Text      string         `json:"text"`
+			ParseMode string         `json:"parse_mode"`
+			Markup    map[string]any `json:"reply_markup"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		if payload.ChatID != 10 || payload.MessageID != 42 || payload.Text != "<b>screen</b>" || payload.ParseMode != "HTML" || payload.Markup["inline_keyboard"] == nil {
+			t.Errorf("edit payload=%+v", payload)
+		}
+		io.WriteString(w, `{"ok":true,"result":true}`)
+	}))
+	defer server.Close()
+	api := &API{token: "test", client: server.Client(), baseURL: server.URL}
+	if err := api.EditScreen(context.Background(), 10, 42, "<b>screen</b>", map[string]any{"inline_keyboard": []any{}}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("edit request was not sent")
+	}
+}
+
+func TestSendScreenRejectsMalformedOrMissingMessageID(t *testing.T) {
+	for _, body := range []string{`{"ok":true,"result":"not-an-object"}`, `{"ok":true,"result":{}}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+		api := &API{token: "test", client: server.Client(), baseURL: server.URL}
+		if _, err := api.SendScreen(context.Background(), 10, "screen", nil); err == nil || !strings.Contains(err.Error(), "decode Telegram sendMessage result") {
+			t.Fatalf("response %s error=%v", body, err)
+		}
+		server.Close()
+	}
+}
+
 type transportFunc func(*http.Request) (*http.Response, error)
 
 func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

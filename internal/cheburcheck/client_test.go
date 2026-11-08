@@ -2,193 +2,253 @@ package cheburcheck
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/theillarion/tg-net-bot/internal/blockcheck"
 )
 
-func TestCheckHTTPAndProbe(t *testing.T) {
-	tests := []struct {
-		name, check, probe  string
-		status, probeStatus int
-		want                string
-		wantErr             bool
-	}{{name: "database verdict", check: `{"blocked":true}`, want: "database: listed as blocked"}, {name: "database false with probe error", check: `{"blocked":false,"id":"abc"}`, probeStatus: 503, want: "database: not found in blocklists; probe returned HTTP 503"}, {name: "probe result", check: `{"id":"x"}`, probe: `data: {"status":"blocked"}
-
-data: {"status":"done"}
-`, want: "status=done"}, {name: "raw body", check: `{"hello":"world"}`, want: `{"hello":"world"}`}, {name: "bad JSON", check: `!`, status: 200, wantErr: true}, {name: "check API failure", check: `oops`, status: 502, wantErr: true}, {name: "empty probe without verdict", check: `{"id":"x"}`, wantErr: true}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasSuffix(r.URL.Path, "/check") {
-					if r.URL.Query().Get("target") != "a b.example" {
-						t.Errorf("target query = %q", r.URL.Query().Get("target"))
-					}
-					w.WriteHeader(defaultStatus(tt.status))
-					fmt.Fprint(w, tt.check)
-					return
-				}
-				if tt.probeStatus != 0 {
-					w.WriteHeader(tt.probeStatus)
-				} else {
-					w.WriteHeader(200)
-				}
-				fmt.Fprint(w, tt.probe)
-			}))
-			defer srv.Close()
-			c := &Client{httpClient: srv.Client(), baseURL: srv.URL}
-			got, err := c.Check(context.Background(), "a b.example")
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("Check error=%v", err)
-			}
-			if err == nil && !strings.Contains(got, tt.want) {
-				t.Fatalf("Check=%q want contains %q", got, tt.want)
-			}
-		})
-	}
-}
-func defaultStatus(v int) int {
-	if v == 0 {
-		return 200
-	}
-	return v
-}
-func TestCompactInterpretAndCanceled(t *testing.T) {
-	if len(compact(strings.Repeat("x", 501))) != 503 {
-		t.Fatal("compact should truncate long strings")
-	}
-	if got := interpret(`{"nested":[{"is_blocked":true}]}`); !strings.Contains(got, "is_blocked=true") {
-		t.Fatalf("interpret=%s", got)
-	}
-	if got := interpret("plain"); got != "plain" {
-		t.Fatalf("raw interpret=%q", got)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	c := &Client{httpClient: http.DefaultClient, baseURL: "http://127.0.0.1:1"}
-	if _, err := c.Check(ctx, "x"); err == nil {
-		t.Fatal("expected canceled request error")
-	}
-}
-
-func TestCheckProbeFallbacksAndScannerLimit(t *testing.T) {
-	cases := []struct {
-		name, check, probe string
-		want               string
-		wantErr            bool
-	}{
-		{name: "false database only", check: `{"is_blocked":false}`, want: "database: not found in blocklists"},
-		{name: "no id raw response", check: `{"status":"unknown"}`, want: `{"status":"unknown"}`},
-		{name: "empty probe with verdict", check: `{"blocked":true,"id":"i"}`, want: "database: listed as blocked"},
-		{name: "empty probe without verdict", check: `{"id":"i"}`, wantErr: true},
-		{name: "probe plain result", check: `{"id":"i"}`, probe: "plain text", want: "plain text"},
-	}
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasSuffix(r.URL.Path, "/check") {
-					io.WriteString(w, tt.check)
-				} else {
-					io.WriteString(w, tt.probe)
-				}
-			}))
-			defer srv.Close()
-			got, err := (&Client{httpClient: srv.Client(), baseURL: srv.URL}).Check(context.Background(), "x")
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("Check error=%v", err)
-			}
-			if err == nil && !strings.Contains(got, tt.want) {
-				t.Fatalf("Check=%q want %q", got, tt.want)
-			}
-		})
-	}
+func TestCheckMakesOnlyPrimaryRequestAndPreservesResponse(t *testing.T) {
+	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/check") {
-			io.WriteString(w, `{"blocked":true,"id":"large"}`)
-			return
+		calls.Add(1)
+		if r.URL.Path != primaryRoute || r.URL.Query().Get("target") != "a b.example" {
+			t.Errorf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
-		io.WriteString(w, "data: "+strings.Repeat("x", 1<<20))
+		_, _ = io.WriteString(w, `{"id":"probe-1","target":"a b.example","target_type":"domain","blocked":false,"rkn_domain":"blocked.example","ips":["192.0.2.1"],"blocked_subnets":["192.0.2.0/24"],"cdn_providers":{"Example":[{"name":"edge"}]},"geo":{"country":"RU"},"asn_info":{"asn":64500},"whitelist":{"reason":"allow"},"subnet_size":"24","reverse_lookup":["host.example"],"complaints":[{"date":"2026-01-01"}]}`)
 	}))
 	defer server.Close()
-	got, err := (&Client{httpClient: server.Client(), baseURL: server.URL}).Check(context.Background(), "x")
-	if err != nil || !strings.Contains(got, "probe read error") {
-		t.Fatalf("oversized event result=%q err=%v", got, err)
+	result, err := NewWithHTTPClient(server.URL, server.Client()).Check(context.Background(), "a b.example")
+	if err != nil {
+		t.Fatal(err)
 	}
-	_ = New()
+	if calls.Load() != 1 {
+		t.Fatalf("request count=%d, want just primary request", calls.Load())
+	}
+	if result.ID != "probe-1" || result.Blocked || result.TargetType != "domain" ||
+		result.RKNDomain == nil || *result.RKNDomain != "blocked.example" ||
+		len(result.IPs) != 1 || len(result.BlockedSubnets) != 1 ||
+		len(result.CDNProviders["Example"]) != 1 || string(result.Geo) != `{"country":"RU"}` ||
+		string(result.ASNInfo) != `{"asn":64500}` || result.Whitelist == nil ||
+		result.SubnetSize == nil || len(result.ReverseLookup) != 1 || len(result.Complaints) != 1 ||
+		!result.ProbeAvailable || result.CheckedAt.IsZero() {
+		t.Fatalf("response fields not preserved: %+v", result)
+	}
 }
 
-type cheburRoundTrip func(*http.Request) (*http.Response, error)
-
-func (f cheburRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-type failedBody struct {
-	readErr, closeErr error
-	data              string
-	read              bool
+func TestCheckClassifiesRateLimitAndRetryAfter(t *testing.T) {
+	for _, test := range []struct {
+		header string
+		want   time.Duration
+	}{
+		{header: "12", want: 12 * time.Second},
+		{header: "n/a", want: 0},
+		{header: "", want: 0},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", test.header)
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		_, err := NewWithHTTPClient(server.URL, server.Client()).Check(context.Background(), "x.example")
+		server.Close()
+		var limited *blockcheck.RateLimitError
+		if !errors.As(err, &limited) || limited.Route != primaryRoute || limited.RetryAfter != test.want {
+			t.Fatalf("error=%#v, rate limit retry=%s", err, test.want)
+		}
+	}
 }
 
-func (b *failedBody) Read(p []byte) (int, error) {
-	if b.read {
-		return 0, io.EOF
+func TestCheckRejectsMissingRequiredVerdict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"target":"edge.example","id":"probe"}`)
+	}))
+	defer server.Close()
+	if _, err := NewWithHTTPClient(server.URL, server.Client()).Check(context.Background(), "edge.example"); err == nil || !strings.Contains(err.Error(), "required blocked verdict") {
+		t.Fatalf("missing verdict error=%v", err)
 	}
-	b.read = true
-	if b.readErr != nil {
-		return 0, b.readErr
-	}
-	return copy(p, b.data), io.EOF
 }
-func (b *failedBody) Close() error { return b.closeErr }
-func TestCheckTransportAndBodyErrors(t *testing.T) {
-	t.Run("initial request failure", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: cheburRoundTrip(func(*http.Request) (*http.Response, error) { return nil, fmt.Errorf("offline") })}, baseURL: "http://test"}
-		if _, err := c.Check(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "call cheburcheck") {
-			t.Fatalf("error=%v", err)
-		}
-	})
-	t.Run("read failure", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: cheburRoundTrip(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Status: "200 OK", Body: &failedBody{readErr: io.ErrUnexpectedEOF}, Header: make(http.Header)}, nil
-		})}, baseURL: "http://test"}
-		if _, err := c.Check(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "read cheburcheck") {
-			t.Fatalf("error=%v", err)
-		}
-	})
-	t.Run("close failure", func(t *testing.T) {
-		c := &Client{httpClient: &http.Client{Transport: cheburRoundTrip(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Status: "200 OK", Body: &failedBody{data: `{"blocked":false}`, closeErr: fmt.Errorf("close")}, Header: make(http.Header)}, nil
-		})}, baseURL: "http://test"}
-		if _, err := c.Check(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "close cheburcheck") {
-			t.Fatalf("error=%v", err)
-		}
-	})
-	t.Run("probe failure with database verdict", func(t *testing.T) {
-		calls := 0
-		c := &Client{httpClient: &http.Client{Transport: cheburRoundTrip(func(*http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				return &http.Response{StatusCode: 200, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"blocked":false,"id":"x"}`)), Header: make(http.Header)}, nil
+
+func TestProbeClassifiesExpiredAndUnavailableResponses(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+			defer server.Close()
+			_, err := NewWithHTTPClient(server.URL, server.Client()).Probe(context.Background(), "probe-id")
+			if status == http.StatusNotFound {
+				if !errors.Is(err, blockcheck.ErrExpired) {
+					t.Fatalf("expired context error=%v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "503") {
+				t.Fatalf("upstream error=%v", err)
 			}
-			return nil, fmt.Errorf("probe offline")
-		})}, baseURL: "http://test"}
-		got, err := c.Check(context.Background(), "x")
-		if err != nil || !strings.Contains(got, "probe unavailable") {
-			t.Fatalf("got=%q err=%v", got, err)
+		})
+	}
+	if _, err := NewWithHTTPClient("http://invalid", http.DefaultClient).Probe(context.Background(), " "); !errors.Is(err, blockcheck.ErrNotFound) {
+		t.Fatalf("empty remote id error=%v", err)
+	}
+}
+
+func TestClientDefaultsAndHTTPDateRetryAfter(t *testing.T) {
+	client := New()
+	if client.baseURL != defaultBaseURL || client.httpClient.Timeout != 90*time.Second {
+		t.Fatalf("default client=%+v timeout=%s", client, client.httpClient.Timeout)
+	}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	delay, ok := parseRetryAfter(now.Add(15*time.Second).Format(http.TimeFormat), now)
+	if !ok || delay != 15*time.Second {
+		t.Fatalf("HTTP-date Retry-After=(%s,%v)", delay, ok)
+	}
+	custom := NewWithHTTPClient("http://example.test/", nil)
+	if custom.baseURL != "http://example.test" || custom.httpClient.Timeout != 90*time.Second {
+		t.Fatalf("nil-client default=%+v", custom)
+	}
+}
+
+func TestProbeParsesSSEAndDoesNotGuessVerdictClasses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != probeRoute+"probe-1" {
+			t.Errorf("probe path=%s", r.URL.Path)
 		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: started\ndata: {\"target\":\"host.example\",\"online_probes\":4}\n\nevent: result\ndata: {\"probe_id\":\"1\",\"verdicts\":[\"ok\"]}\n\nevent: result\ndata: {\"probe_id\":\"2\",\"verdicts\":[\"uncertain\",\"tspu_block\"]}\n\nevent: done\ndata: {\"online_probes\":4,\"response_count\":2}\n\n")
+	}))
+	defer server.Close()
+	var progress []blockcheck.ProbeResult
+	result, err := NewWithHTTPClient(server.URL, server.Client()).ProbeWithEvents(context.Background(), "probe-1", func(update blockcheck.ProbeResult) {
+		progress = append(progress, update)
 	})
-	t.Run("probe failure without verdict", func(t *testing.T) {
-		calls := 0
-		c := &Client{httpClient: &http.Client{Transport: cheburRoundTrip(func(*http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				return &http.Response{StatusCode: 200, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"id":"x"}`)), Header: make(http.Header)}, nil
-			}
-			return nil, fmt.Errorf("probe offline")
-		})}, baseURL: "http://test"}
-		if _, err := c.Check(context.Background(), "x"); err == nil || !strings.Contains(err.Error(), "call cheburcheck probe") {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Target != "host.example" || result.Stats.Online != 4 || result.Stats.Responded != 2 ||
+		result.Stats.Unanswered != 2 || len(result.Events) != 4 || result.Verdicts["ok"] != 1 ||
+		result.Verdicts["uncertain"] != 1 || result.Verdicts["tspu_block"] != 1 || result.Events[3].Type != "done" {
+		t.Fatalf("probe result=%+v", result)
+	}
+	if len(progress) != 4 || progress[1].Stats.Responded != 1 || progress[3].Stats.Responded != 2 {
+		t.Fatalf("stream progress=%+v", progress)
+	}
+}
+
+func TestProbeRateLimitAndMalformedEvent(t *testing.T) {
+	t.Run("429", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer server.Close()
+		_, err := NewWithHTTPClient(server.URL, server.Client()).Probe(context.Background(), "id")
+		var limited *blockcheck.RateLimitError
+		if !errors.As(err, &limited) || limited.Route != probeRoute {
 			t.Fatalf("error=%v", err)
 		}
 	})
+	t.Run("malformed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "event: started\ndata: invalid\n\n")
+		}))
+		defer server.Close()
+		_, err := NewWithHTTPClient(server.URL, server.Client()).Probe(context.Background(), "id")
+		if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
+func TestCheckTransportAndDecodeErrors(t *testing.T) {
+	t.Run("transport", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("offline")
+		})}
+		_, err := NewWithHTTPClient("http://mock", client).Check(context.Background(), "x.example")
+		if err == nil || !strings.Contains(err.Error(), "call cheburcheck") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("decode", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "!") }))
+		defer server.Close()
+		_, err := NewWithHTTPClient(server.URL, server.Client()).Check(context.Background(), "x.example")
+		if err == nil || !strings.Contains(err.Error(), "decode cheburcheck response") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
+type failedReadBody struct{}
+
+func (failedReadBody) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+func (failedReadBody) Close() error             { return nil }
+
+func TestClientReportsHTTPBodyAndSSEStreamFailures(t *testing.T) {
+	client := NewWithHTTPClient("http://mock", &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/probe/") {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: failedReadBody{}, Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("upstream")), Request: req}, nil
+	})})
+	if _, err := client.Check(context.Background(), "edge.example"); err == nil || !strings.Contains(err.Error(), "HTTP 502") {
+		t.Fatalf("HTTP failure = %v", err)
+	}
+	if _, err := client.Probe(context.Background(), "probe-id"); err == nil || !strings.Contains(err.Error(), "read cheburcheck probe stream") {
+		t.Fatalf("stream read failure = %v", err)
+	}
+	if _, err := NewWithHTTPClient("http://mock", &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: failedReadBody{}, Request: req}, nil
+	})}).Check(context.Background(), "edge.example"); err == nil || !strings.Contains(err.Error(), "read cheburcheck response") {
+		t.Fatalf("body read failure = %v", err)
+	}
+}
+
+func TestProbeIgnoresUnknownSSEEventsAndRejectsEmptyStreams(t *testing.T) {
+	for _, test := range []struct {
+		body      string
+		wantError bool
+	}{
+		{body: "", wantError: true},
+		{body: ": heartbeat\n\n", wantError: true},
+		{body: "event: custom\ndata: {\"opaque\":true}\n\n"},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, test.body) }))
+		_, err := NewWithHTTPClient(server.URL, server.Client()).Probe(context.Background(), "id")
+		server.Close()
+		if test.wantError && (err == nil || !strings.Contains(err.Error(), "no events")) {
+			t.Fatalf("body %q error=%v", test.body, err)
+		}
+		if !test.wantError && err != nil {
+			t.Fatalf("unknown event should be preserved: %v", err)
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProbeStatsUnknownWhenNoDoneCounts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "event: started\ndata: {\"target\":\"x\",\"online_probes\":3}\n\nevent: result\ndata: {\"probe_id\":\"1\",\"verdicts\":[\"ok\"]}\n\n")
+	}))
+	defer server.Close()
+	result, err := NewWithHTTPClient(server.URL, server.Client()).Probe(context.Background(), "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stats.Online != 3 || result.Stats.Responded != 1 || result.Stats.Unanswered != 2 {
+		t.Fatalf("stats=%+v", result.Stats)
+	}
+	var roundtrip map[string]any
+	if err := json.Unmarshal(result.Events[0].Data, &roundtrip); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := roundtrip["target"]; !ok {
+		t.Fatal(fmt.Sprintf("event lost source fields: %s", result.Events[0].Data))
+	}
 }
