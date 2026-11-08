@@ -77,6 +77,27 @@ func (a *API) SendWithMarkup(ctx context.Context, chatID int64, text string, mar
 	return a.Call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": text, "reply_markup": markup}, nil)
 }
 
+func (a *API) SendScreen(ctx context.Context, chatID int64, text string, markup any) (int, error) {
+	var raw json.RawMessage
+	if err := a.Call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": text, "parse_mode": "HTML", "reply_markup": markup}, &raw); err != nil {
+		return 0, err
+	}
+	var message struct {
+		MessageID int `json:"message_id"`
+	}
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return 0, fmt.Errorf("decode Telegram sendMessage result: %w", err)
+	}
+	if message.MessageID == 0 {
+		return 0, fmt.Errorf("decode Telegram sendMessage result: missing message_id")
+	}
+	return message.MessageID, nil
+}
+
+func (a *API) EditScreen(ctx context.Context, chatID int64, messageID int, text string, markup any) error {
+	return a.Call(ctx, "editMessageText", map[string]any{"chat_id": chatID, "message_id": messageID, "text": text, "parse_mode": "HTML", "reply_markup": markup}, nil)
+}
+
 func (a *API) AnswerCallback(ctx context.Context, callbackID, text string) error {
 	return a.Call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": callbackID, "text": text}, nil)
 }
