@@ -21,6 +21,7 @@ if [ ! -d "$INSTALL_DIR/.git" ]; then
   git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 cd "$INSTALL_DIR"
+printf 'Installing in: %s\n' "$PWD"
 
 if [ -f .env ]; then
   printf 'Existing .env found. Replace it? [y/N] '
