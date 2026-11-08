@@ -17,6 +17,14 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+printf 'Installation directory [%s]: ' "$INSTALL_DIR"
+if ! IFS= read -r requested_dir; then
+  requested_dir=
+fi
+if [ -n "$requested_dir" ]; then
+  INSTALL_DIR=$requested_dir
+fi
+
 if [ ! -d "$INSTALL_DIR/.git" ]; then
   git clone "$REPO_URL" "$INSTALL_DIR"
 fi
