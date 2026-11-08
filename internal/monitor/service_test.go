@@ -215,6 +215,36 @@ func TestTargetsAlertsCRUD(t *testing.T) {
 	}
 	_ = a
 }
+
+func TestAddAlertWithIDIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	r := &fakeRepo{state: domain.EmptyState()}
+	s := newTestService(t, r, &fakeNetwork{}, &fakeBlock{}, &fakeNotifier{})
+	if err := s.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddAlertWithID(ctx, "", 10, 1, "edge", "tcp", "443", time.Minute); err == nil {
+		t.Fatal("accepted an empty alert request ID")
+	}
+	first, err := s.AddAlertWithID(ctx, "form-id", 10, 1, "edge", "tcp", "443", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := s.AddAlertWithID(ctx, "form-id", 10, 1, "edge", "tcp", "443", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry != first || len(s.Alerts(1)) != 1 {
+		t.Fatalf("idempotent retry = %+v; stored alerts = %+v", retry, s.Alerts(1))
+	}
+	if _, err = s.AddAlertWithID(ctx, "form-id", 10, 1, "edge", "icmp", "", time.Minute); err == nil {
+		t.Fatal("reused request ID for a different alert")
+	}
+	if len(s.Alerts(1)) != 1 {
+		t.Fatalf("request ID conflict changed alerts: %+v", s.Alerts(1))
+	}
+}
+
 func TestRecordTransitionsAndErrors(t *testing.T) {
 	ctx := context.Background()
 	a := domain.Alert{ID: "a", ChatID: 7, UserID: 1, Target: domain.Target{Name: "edge", Host: "edge.example"}, Method: "tcp"}

@@ -19,6 +19,16 @@ type Alert struct {
 	LastUp    *bool         `json:"last_up,omitempty"`
 }
 
+// Interaction stores an in-progress Telegram form so it can resume after restart.
+type Interaction struct {
+	Step      string
+	Name      string
+	Host      string
+	Method    string
+	Argument  string
+	RequestID string
+}
+
 type State struct {
 	Targets map[string][]Target `json:"targets"`
 	Alerts  []Alert             `json:"alerts"`

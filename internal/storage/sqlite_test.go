@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"github.com/theillarion/tg-net-bot/internal/domain"
 	"os"
 	"path/filepath"
@@ -56,6 +57,90 @@ func TestSQLiteLifecycle(t *testing.T) {
 		t.Fatal("expected missing target error")
 	}
 }
+
+func TestInteractionSurvivesSQLiteRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "bot.sqlite")
+	state := domain.Interaction{Step: "manual-tcp-port", Name: "prod", Host: "illarion.tech", Method: "tcp", RequestID: "form-id"}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.SaveInteraction(ctx, 42, state); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	interactions, err := db.LoadInteractions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := interactions[42]; got != state {
+		t.Fatalf("restored interaction = %+v, want %+v", got, state)
+	}
+	state.Step, state.Argument = "add-alert-interval", "443"
+	if err = db.SaveInteraction(ctx, 42, state); err != nil {
+		t.Fatal(err)
+	}
+	interactions, err = db.LoadInteractions(ctx)
+	if err != nil || interactions[42] != state || len(interactions) != 1 {
+		t.Fatalf("upserted interactions = %+v, err=%v", interactions, err)
+	}
+	if err = db.DeleteInteraction(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	interactions, err = db.LoadInteractions(ctx)
+	if err != nil || len(interactions) != 0 {
+		t.Fatalf("deleted interactions = %+v, err=%v", interactions, err)
+	}
+}
+
+func TestOpenMigratesLegacyInteractionTable(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.sqlite")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`CREATE TABLE interactions(user_id INTEGER PRIMARY KEY, step TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', host TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', argument TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`INSERT INTO interactions(user_id, step, name, host, method, argument) VALUES(7, 'add-alert-interval', 'edge', 'example.com', 'tcp', '443')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	interactions, err := db.LoadInteractions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := domain.Interaction{Step: "add-alert-interval", Name: "edge", Host: "example.com", Method: "tcp", Argument: "443"}
+	if interactions[7] != legacy {
+		t.Fatalf("migrated interaction = %+v, want %+v", interactions[7], legacy)
+	}
+	legacy.RequestID = "form-id"
+	if err = db.SaveInteraction(ctx, 7, legacy); err != nil {
+		t.Fatal(err)
+	}
+	interactions, err = db.LoadInteractions(ctx)
+	if err != nil || interactions[7] != legacy {
+		t.Fatalf("updated migrated interaction = %+v, err=%v", interactions[7], err)
+	}
+}
+
 func TestOpenCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS alerts (
     FOREIGN KEY (user_id, target_name) REFERENCES targets(user_id, name) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS alerts_user_id_idx ON alerts(user_id);
+CREATE TABLE IF NOT EXISTS interactions (
+    user_id INTEGER PRIMARY KEY,
+    step TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    method TEXT NOT NULL DEFAULT '',
+    argument TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT ''
+);
 `
 
 func Open(ctx context.Context, path string) (*SQLite, error) {
@@ -82,8 +91,25 @@ func initializeSchema(ctx context.Context, db *sql.DB) error {
 			return errors.Join(fmt.Errorf("initialize SQLite schema: %w", err), tx.Rollback())
 		}
 	}
+	if err := ensureInteractionRequestIDColumn(ctx, tx); err != nil {
+		return errors.Join(fmt.Errorf("migrate dialog interactions: %w", err), tx.Rollback())
+	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit SQLite schema initialization: %w", err)
+	}
+	return nil
+}
+
+func ensureInteractionRequestIDColumn(ctx context.Context, tx *sql.Tx) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pragma_table_info('interactions') WHERE name = ?)`, "request_id").Scan(&exists); err != nil {
+		return fmt.Errorf("inspect dialog interaction schema: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "ALTER TABLE interactions ADD COLUMN request_id TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add dialog interaction request id: %w", err)
 	}
 	return nil
 }
@@ -209,6 +235,44 @@ func (s *SQLite) SetAlertLastUp(ctx context.Context, id string, up bool) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE alerts SET last_up = ? WHERE id = ?", value, id)
 	if err != nil {
 		return fmt.Errorf("update alert state: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) LoadInteractions(ctx context.Context) (map[int64]domain.Interaction, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id, step, name, host, method, argument, request_id FROM interactions`)
+	if err != nil {
+		return nil, fmt.Errorf("query dialog interactions: %w", err)
+	}
+	defer rows.Close()
+	interactions := make(map[int64]domain.Interaction)
+	for rows.Next() {
+		var userID int64
+		var state domain.Interaction
+		if err := rows.Scan(&userID, &state.Step, &state.Name, &state.Host, &state.Method, &state.Argument, &state.RequestID); err != nil {
+			return nil, fmt.Errorf("scan dialog interaction: %w", err)
+		}
+		interactions[userID] = state
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dialog interactions: %w", err)
+	}
+	return interactions, nil
+}
+
+func (s *SQLite) SaveInteraction(ctx context.Context, userID int64, state domain.Interaction) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO interactions(user_id, step, name, host, method, argument, request_id) VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET step=excluded.step, name=excluded.name, host=excluded.host, method=excluded.method, argument=excluded.argument, request_id=excluded.request_id`,
+		userID, state.Step, state.Name, state.Host, state.Method, state.Argument, state.RequestID)
+	if err != nil {
+		return fmt.Errorf("save dialog interaction: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteInteraction(ctx context.Context, userID int64) error {
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM interactions WHERE user_id = ?", userID); err != nil {
+		return fmt.Errorf("delete dialog interaction: %w", err)
 	}
 	return nil
 }

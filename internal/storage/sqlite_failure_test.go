@@ -31,6 +31,9 @@ func TestSQLiteUnavailableDatabase(t *testing.T) {
 		{"delete alert", func() error { return db.DeleteAlert(ctx, 1, "a") }},
 		{"update check time", func() error { return db.SetAlertLastCheck(ctx, "a", time.Now()) }},
 		{"update state", func() error { return db.SetAlertLastUp(ctx, "a", false) }},
+		{"load interactions", func() error { _, err := db.LoadInteractions(ctx); return err }},
+		{"save interaction", func() error { return db.SaveInteraction(ctx, 1, domain.Interaction{Step: "add-name"}) }},
+		{"delete interaction", func() error { return db.DeleteInteraction(ctx, 1) }},
 	}
 	for _, op := range operations {
 		t.Run(op.name, func(t *testing.T) {
@@ -100,6 +103,29 @@ func TestSQLiteDetectsDamagedStoredRows(t *testing.T) {
 		t.Fatal("Load accepted malformed alert row")
 	}
 	_ = alertDB.Close()
+
+	interactionPath := filepath.Join(t.TempDir(), "bad-interaction.sqlite")
+	raw, err = sql.Open("sqlite", interactionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`CREATE TABLE interactions(user_id INTEGER, step TEXT, name TEXT, host TEXT, method TEXT, argument TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`INSERT INTO interactions VALUES('not-a-user-id','add-name','','','','')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	interactionDB, err := Open(ctx, interactionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = interactionDB.LoadInteractions(ctx); err == nil {
+		t.Fatal("LoadInteractions accepted malformed user id")
+	}
+	_ = interactionDB.Close()
 }
 
 func TestOpenRejectsIncompatibleExistingSchema(t *testing.T) {

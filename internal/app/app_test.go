@@ -21,7 +21,18 @@ func TestServeCanceled(t *testing.T) {
 	cfg := config.Config{DatabasePath: filepath.Join(t.TempDir(), "state.db"), Token: "test", AllowedUsers: map[int64]struct{}{1: {}}}
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	err := serve(context.Background(), cfg, logger, func(ctx context.Context, path string) (appState, error) { return storage.Open(ctx, path) }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+	err := serve(context.Background(), cfg, logger, func(ctx context.Context, path string) (appState, error) { return storage.Open(ctx, path) }, telegram.NewAPI, func(ctx context.Context, _ *telegram.API, _ *monitor.Service, _ map[int64]struct{}, _ *slog.Logger, store telegram.InteractionStore) error {
+		want := domain.Interaction{Step: "add-host", Name: "edge"}
+		if err := store.SaveInteraction(ctx, 1, want); err != nil {
+			return err
+		}
+		got, err := store.LoadInteractions(ctx)
+		if err != nil {
+			return err
+		}
+		if got[1] != want {
+			return errors.New("app did not pass the SQLite interaction store")
+		}
 		return context.Canceled
 	})
 	if err != nil {
@@ -49,10 +60,17 @@ func (f failingLoadState) InsertAlert(context.Context, domain.Alert) error      
 func (f failingLoadState) DeleteAlert(context.Context, int64, string) error           { return nil }
 func (f failingLoadState) SetAlertLastCheck(context.Context, string, time.Time) error { return nil }
 func (f failingLoadState) SetAlertLastUp(context.Context, string, bool) error         { return nil }
-func (f failingLoadState) Close() error                                               { return f.closeErr }
+func (f failingLoadState) LoadInteractions(context.Context) (map[int64]domain.Interaction, error) {
+	return nil, nil
+}
+func (f failingLoadState) SaveInteraction(context.Context, int64, domain.Interaction) error {
+	return nil
+}
+func (f failingLoadState) DeleteInteraction(context.Context, int64) error { return nil }
+func (f failingLoadState) Close() error                                   { return f.closeErr }
 func TestServeDependencyFailures(t *testing.T) {
 	cfg := config.Config{DatabasePath: "x", Token: "x", AllowedUsers: map[int64]struct{}{1: {}}}
-	if err := serve(context.Background(), cfg, nil, func(context.Context, string) (appState, error) { return nil, errors.New("open failed") }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+	if err := serve(context.Background(), cfg, nil, func(context.Context, string) (appState, error) { return nil, errors.New("open failed") }, telegram.NewAPI, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger, telegram.InteractionStore) error {
 		return nil
 	}); err == nil || !strings.Contains(err.Error(), "open application database") {
 		t.Fatalf("open error=%v", err)
@@ -60,7 +78,7 @@ func TestServeDependencyFailures(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	err := serve(context.Background(), cfg, logger, func(context.Context, string) (appState, error) {
 		return failingLoadState{closeErr: errors.New("close failed")}, nil
-	}, func(string, string) (*telegram.API, error) { return &telegram.API{}, nil }, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error {
+	}, func(string, string) (*telegram.API, error) { return &telegram.API{}, nil }, func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger, telegram.InteractionStore) error {
 		return nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "initialize monitor") {
@@ -71,7 +89,7 @@ func TestServeDependencyFailures(t *testing.T) {
 func TestRunTelegramBotHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := runTelegramBot(ctx, &telegram.API{}, nil, nil, nil); !errors.Is(err, context.Canceled) {
+	if err := runTelegramBot(ctx, &telegram.API{}, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("runTelegramBot error=%v", err)
 	}
 }

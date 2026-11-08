@@ -133,6 +133,16 @@ func (s *Service) RemoveTarget(ctx context.Context, user int64, name string) err
 	return nil
 }
 func (s *Service) AddAlert(ctx context.Context, chat, user int64, name, method, argument string, interval time.Duration) (domain.Alert, error) {
+	return s.AddAlertWithID(ctx, NewAlertID(), chat, user, name, method, argument, interval)
+}
+
+// NewAlertID creates an ID that can be persisted with a form before creating an alert.
+func NewAlertID() string { return strconv.FormatInt(time.Now().UnixNano(), 36) }
+
+func (s *Service) AddAlertWithID(ctx context.Context, id string, chat, user int64, name, method, argument string, interval time.Duration) (domain.Alert, error) {
+	if id == "" {
+		return domain.Alert{}, fmt.Errorf("alert ID must not be empty")
+	}
 	m, arg, err := checker.Parse(method, argument)
 	if err != nil {
 		return domain.Alert{}, err
@@ -142,6 +152,15 @@ func (s *Service) AddAlert(ctx context.Context, chat, user int64, name, method, 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, existing := range s.state.Alerts {
+		if existing.ID != id {
+			continue
+		}
+		if existing.ChatID == chat && existing.UserID == user && strings.EqualFold(existing.Target.Name, name) && existing.Method == string(m) && existing.Argument == arg && existing.Interval == interval {
+			return existing, nil
+		}
+		return domain.Alert{}, fmt.Errorf("alert ID already belongs to a different request")
+	}
 	var target *domain.Target
 	for i := range s.state.Targets[userKey(user)] {
 		if strings.EqualFold(s.state.Targets[userKey(user)][i].Name, name) {
@@ -152,7 +171,7 @@ func (s *Service) AddAlert(ctx context.Context, chat, user int64, name, method, 
 	if target == nil {
 		return domain.Alert{}, fmt.Errorf("saved target not found")
 	}
-	alert := domain.Alert{ID: strconv.FormatInt(time.Now().UnixNano(), 36), ChatID: chat, UserID: user, Target: *target, Method: string(m), Argument: arg, Interval: interval}
+	alert := domain.Alert{ID: id, ChatID: chat, UserID: user, Target: *target, Method: string(m), Argument: arg, Interval: interval}
 	if err = s.repo.InsertAlert(ctx, alert); err != nil {
 		return domain.Alert{}, fmt.Errorf("save alert: %w", err)
 	}

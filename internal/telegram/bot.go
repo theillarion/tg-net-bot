@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/theillarion/tg-net-bot/internal/checker"
+	"github.com/theillarion/tg-net-bot/internal/domain"
 	"github.com/theillarion/tg-net-bot/internal/monitor"
 )
 
@@ -23,12 +24,12 @@ const (
 	buttonHelp    = "❓ Помощь"
 )
 
-type interaction struct {
-	Step     string
-	Name     string
-	Host     string
-	Method   string
-	Argument string
+type interaction = domain.Interaction
+
+type InteractionStore interface {
+	LoadInteractions(context.Context) (map[int64]domain.Interaction, error)
+	SaveInteraction(context.Context, int64, domain.Interaction) error
+	DeleteInteraction(context.Context, int64) error
 }
 
 type Bot struct {
@@ -37,6 +38,7 @@ type Bot struct {
 	api       *API
 	service   *monitor.Service
 	allowed   map[int64]struct{}
+	store     InteractionStore
 	pending   map[int64]interaction
 	queues    map[int64]chan Update
 	logger    *slog.Logger
@@ -72,14 +74,29 @@ type InlineButton struct {
 	CallbackData string `json:"callback_data"`
 }
 
-func NewBot(api *API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger) *Bot {
+func NewBot(api *API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger, stores ...InteractionStore) *Bot {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bot{api: api, service: service, allowed: allowed, pending: make(map[int64]interaction), queues: make(map[int64]chan Update), logger: logger}
+	var store InteractionStore
+	if len(stores) > 0 {
+		store = stores[0]
+	}
+	return &Bot{api: api, service: service, allowed: allowed, store: store, pending: make(map[int64]interaction), queues: make(map[int64]chan Update), logger: logger}
 }
 
 func (b *Bot) Run(ctx context.Context) error {
+	if b.store != nil {
+		pending, err := b.store.LoadInteractions(ctx)
+		if err != nil {
+			return fmt.Errorf("restore Telegram dialog state: %w", err)
+		}
+		b.pendingMu.Lock()
+		for userID, state := range pending {
+			b.pending[userID] = state
+		}
+		b.pendingMu.Unlock()
+	}
 	offset := 0
 	connected := false
 	for {
@@ -167,13 +184,9 @@ func (b *Bot) handleMessage(ctx context.Context, message Message) {
 	b.pendingMu.Lock()
 	pending, hasPending := b.pending[userID]
 	if hasPending && !strings.HasPrefix(input, "/") {
-		delete(b.pending, userID)
 		b.pendingMu.Unlock()
 		b.handlePending(ctx, chatID, userID, pending, input)
 		return
-	}
-	if hasPending && strings.HasPrefix(input, "/") {
-		delete(b.pending, userID)
 	}
 	b.pendingMu.Unlock()
 
@@ -195,7 +208,9 @@ func (b *Bot) handleMessage(ctx context.Context, message Message) {
 			b.addTarget(ctx, chatID, userID, args[0], args[1])
 			return
 		}
-		b.setPending(userID, interaction{Step: "add-name"})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "add-name"}) {
+			return
+		}
 		b.send(ctx, chatID, "Как назвать сервер?")
 	case "hosts":
 		b.listTargets(ctx, chatID, userID)
@@ -231,19 +246,24 @@ func (b *Bot) handleMessage(ctx context.Context, message Message) {
 func (b *Bot) handleMenuButton(ctx context.Context, chatID, userID int64, input string) bool {
 	switch input {
 	case buttonCheck, buttonBlock, buttonAdd, buttonTargets, buttonNewRule, buttonRules, buttonHelp:
-		b.clearPending(userID)
 	default:
 		return false
 	}
 	switch input {
 	case buttonCheck:
-		b.setPending(userID, interaction{Step: "check-target"})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "check-target"}) {
+			return true
+		}
 		b.send(ctx, chatID, "Укажи сервер по IP, домену или имени сохранённого сервера для проверки доступности.")
 	case buttonBlock:
-		b.setPending(userID, interaction{Step: "block-target"})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "block-target"}) {
+			return true
+		}
 		b.send(ctx, chatID, "Укажи сервер по IP, домену или имени сохранённого сервера для проверки в Cheburcheck.")
 	case buttonAdd:
-		b.setPending(userID, interaction{Step: "add-name"})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "add-name"}) {
+			return true
+		}
 		b.send(ctx, chatID, "Как назвать сервер?")
 	case buttonTargets:
 		b.listTargets(ctx, chatID, userID)
@@ -268,20 +288,46 @@ func (b *Bot) handlePending(ctx context.Context, chatID, userID int64, pending i
 			return
 		}
 		pending.Name, pending.Step = value, "add-host"
-		b.setPending(userID, pending)
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.send(ctx, chatID, "Теперь укажи сервер: IP или домен.")
 	case "add-host":
-		b.addTarget(ctx, chatID, userID, pending.Name, value)
+		if err := b.service.AddTarget(ctx, userID, pending.Name, value); err != nil {
+			if existing, ok := b.service.FindTarget(userID, pending.Name); !ok || !strings.EqualFold(existing.Host, value) {
+				if ok {
+					if !b.setPending(ctx, chatID, userID, interaction{Step: "add-name"}) {
+						return
+					}
+					b.send(ctx, chatID, "Имя уже занято. Введи другое имя сервера.")
+					return
+				}
+				b.send(ctx, chatID, "Не удалось добавить сервер: "+err.Error()+" Попробуй указать IP или домен ещё раз.")
+				return
+			}
+		}
+		if !b.clearPending(ctx, chatID, userID) {
+			b.send(ctx, chatID, "Сервер сохранён, но форму не удалось завершить. Проверь список серверов перед повтором.")
+			return
+		}
+		b.send(ctx, chatID, fmt.Sprintf("Сохранил «%s» — %s. Открой «Мои серверы», чтобы проверить его или настроить алерт.", pending.Name, value))
 	case "check-target":
 		target := b.resolveTarget(userID, value)
 		if target == "" {
 			b.send(ctx, chatID, "Не нашёл сервер с таким именем. Проверь IP или домен и попробуй снова.")
 			return
 		}
-		b.setPending(userID, interaction{Step: "check-method", Host: target})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "check-method", Host: target}) {
+			return
+		}
 		b.sendInline(ctx, chatID, "Каким способом проверить доступность?", methodKeyboard("check-method"))
 	case "manual-tcp-port":
+		if _, _, err := checker.Parse("tcp", value); err != nil {
+			b.send(ctx, chatID, err.Error()+" Отправь порт от 1 до 65535.")
+			return
+		}
 		b.runManualCheck(ctx, chatID, pending.Host, "tcp", value)
+		b.clearPending(ctx, chatID, userID)
 	case "block-target":
 		target := b.resolveTarget(userID, value)
 		if target == "" {
@@ -289,23 +335,24 @@ func (b *Bot) handlePending(ctx context.Context, chatID, userID int64, pending i
 			return
 		}
 		b.manualBlock(ctx, chatID, target)
+		b.clearPending(ctx, chatID, userID)
 	case "add-alert-interval":
 		interval, err := time.ParseDuration(value)
 		if err != nil || interval <= 0 {
-			b.setPending(userID, pending)
 			b.send(ctx, chatID, "Нужен положительный интервал, например 30s, 5m или 2h. Попробуй ещё раз.")
 			return
 		}
 		b.createAlert(ctx, chatID, userID, pending, interval)
 	case "add-alert-tcp-port":
 		if _, _, err := checker.Parse("tcp", value); err != nil {
-			b.setPending(userID, pending)
 			b.send(ctx, chatID, err.Error()+" Попробуй ещё раз.")
 			return
 		}
 		pending.Argument = value
 		pending.Step = "add-alert-interval"
-		b.setPending(userID, pending)
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.send(ctx, chatID, "Как часто проверять этот алерт? Например: 1m, 15m, 2h.")
 	}
 }
@@ -334,20 +381,23 @@ func (b *Bot) handleCallback(ctx context.Context, callback CallbackQuery) {
 			b.send(ctx, chatID, "Это меню проверки уже устарело. Начни проверку заново кнопкой «Проверить доступность».")
 			return
 		}
-		b.clearPending(callback.From.ID)
 		b.runManualCheck(ctx, chatID, pending.Host, "http", parts[1])
+		b.clearPending(ctx, chatID, callback.From.ID)
 	case "alert-target":
 		b.selectAlertTarget(ctx, chatID, callback.From.ID, parts[1])
 	case "alert-method":
 		b.selectAlertMethod(ctx, chatID, callback.From.ID, parts[1])
 	case "alert-http":
 		pending := b.getPending(callback.From.ID)
+		if pending.Step != "alert-http" || !checker.ValidHost(pending.Host) {
+			b.send(ctx, chatID, "Это меню настройки алерта уже устарело. Открой «Настроить алерт» и продолжи.")
+			return
+		}
 		pending.Method, pending.Argument = "http", parts[1]
 		b.askAlertInterval(ctx, chatID, callback.From.ID, pending)
 	case "target-check", "target-block", "target-alert", "target-remove":
 		b.handleTargetAction(ctx, chatID, callback.From.ID, parts[0], at(parts, 1))
 	case "alert-remove":
-		b.clearPending(callback.From.ID)
 		if err := b.service.RemoveAlert(ctx, callback.From.ID, at(parts, 1)); err != nil {
 			b.send(ctx, chatID, "Не удалось удалить алерт: "+err.Error())
 			return
@@ -364,15 +414,19 @@ func (b *Bot) selectManualMethod(ctx context.Context, chatID, userID int64, meth
 	}
 	switch method {
 	case "icmp":
-		b.clearPending(userID)
 		b.runManualCheck(ctx, chatID, pending.Host, method, "")
+		b.clearPending(ctx, chatID, userID)
 	case "tcp":
 		pending.Step = "manual-tcp-port"
-		b.setPending(userID, pending)
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.send(ctx, chatID, "Какой TCP-порт проверить? Отправь номер, например 443.")
 	case "http":
 		pending.Step = "manual-http"
-		b.setPending(userID, pending)
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.sendInline(ctx, chatID, "Проверить HTTPS или HTTP?", [][]InlineButton{{{Text: "HTTPS", CallbackData: "manual-http:https"}, {Text: "HTTP", CallbackData: "manual-http:http"}}})
 	default:
 		b.send(ctx, chatID, "Неизвестный способ проверки. Начни проверку заново.")
@@ -380,6 +434,10 @@ func (b *Bot) selectManualMethod(ctx context.Context, chatID, userID int64, meth
 }
 
 func (b *Bot) selectAlertTarget(ctx context.Context, chatID, userID int64, rawIndex string) {
+	if pending := b.getPending(userID); pending.Step != "alert-target" {
+		b.send(ctx, chatID, "Это меню выбора сервера для алерта уже устарело. Открой «Настроить алерт» и продолжи.")
+		return
+	}
 	index, err := strconv.Atoi(rawIndex)
 	targets := b.service.Targets(userID)
 	if err != nil || index < 0 || index >= len(targets) {
@@ -387,21 +445,33 @@ func (b *Bot) selectAlertTarget(ctx context.Context, chatID, userID int64, rawIn
 		return
 	}
 	target := targets[index]
-	b.setPending(userID, interaction{Step: "alert-method", Name: target.Name, Host: target.Host})
+	if !b.setPending(ctx, chatID, userID, interaction{Step: "alert-method", Name: target.Name, Host: target.Host, RequestID: monitor.NewAlertID()}) {
+		return
+	}
 	b.sendInline(ctx, chatID, fmt.Sprintf("Как проверять «%s»?", target.Name), methodKeyboard("alert-method"))
 }
 
 func (b *Bot) selectAlertMethod(ctx context.Context, chatID, userID int64, method string) {
 	pending := b.getPending(userID)
+	if pending.Step != "alert-method" || !checker.ValidHost(pending.Host) || pending.Name == "" {
+		b.send(ctx, chatID, "Это меню настройки алерта уже устарело. Открой «Настроить алерт» и продолжи.")
+		return
+	}
 	pending.Method = method
 	switch method {
 	case "icmp":
 		b.askAlertInterval(ctx, chatID, userID, pending)
 	case "tcp":
 		pending.Step = "add-alert-tcp-port"
-		b.setPending(userID, pending)
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.send(ctx, chatID, "Какой TCP-порт проверять? Например, 22 или 443.")
 	case "http":
+		pending.Step = "alert-http"
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
 		b.sendInline(ctx, chatID, "Проверять HTTP или HTTPS?", [][]InlineButton{{{Text: "HTTPS", CallbackData: "alert-http:https"}, {Text: "HTTP", CallbackData: "alert-http:http"}}})
 	default:
 		b.send(ctx, chatID, "Неизвестный способ проверки.")
@@ -410,14 +480,26 @@ func (b *Bot) selectAlertMethod(ctx context.Context, chatID, userID int64, metho
 
 func (b *Bot) askAlertInterval(ctx context.Context, chatID, userID int64, pending interaction) {
 	pending.Step = "add-alert-interval"
-	b.setPending(userID, pending)
+	if !b.setPending(ctx, chatID, userID, pending) {
+		return
+	}
 	b.send(ctx, chatID, "Как часто запускать алерт для этого сервера? Например: 1m, 15m, 2h.")
 }
 
 func (b *Bot) createAlert(ctx context.Context, chatID, userID int64, pending interaction, interval time.Duration) {
-	alert, err := b.service.AddAlert(ctx, chatID, userID, pending.Name, pending.Method, pending.Argument, interval)
+	if pending.RequestID == "" {
+		pending.RequestID = monitor.NewAlertID()
+		if !b.setPending(ctx, chatID, userID, pending) {
+			return
+		}
+	}
+	alert, err := b.service.AddAlertWithID(ctx, pending.RequestID, chatID, userID, pending.Name, pending.Method, pending.Argument, interval)
 	if err != nil {
 		b.send(ctx, chatID, "Не удалось создать алерт: "+err.Error())
+		return
+	}
+	if !b.clearPending(ctx, chatID, userID) {
+		b.send(ctx, chatID, "Алерт создан, но состояние формы не удалось очистить. Проверь список алертов перед повторной настройкой.")
 		return
 	}
 	b.send(ctx, chatID, fmt.Sprintf("Алерт настроен для «%s»: %s, каждые %s. При недоступности проверю Cheburcheck.", alert.Target.Name, alert.Method, alert.Interval))
@@ -433,16 +515,18 @@ func (b *Bot) handleTargetAction(ctx context.Context, chatID, userID int64, acti
 	target := targets[index]
 	switch action {
 	case "target-check":
-		b.setPending(userID, interaction{Step: "check-method", Host: target.Host})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "check-method", Host: target.Host}) {
+			return
+		}
 		b.sendInline(ctx, chatID, fmt.Sprintf("Как проверить «%s»?", target.Name), methodKeyboard("check-method"))
 	case "target-block":
-		b.clearPending(userID)
 		b.manualBlock(ctx, chatID, target.Host)
 	case "target-alert":
-		b.setPending(userID, interaction{Step: "alert-method", Name: target.Name, Host: target.Host})
+		if !b.setPending(ctx, chatID, userID, interaction{Step: "alert-method", Name: target.Name, Host: target.Host, RequestID: monitor.NewAlertID()}) {
+			return
+		}
 		b.sendInline(ctx, chatID, fmt.Sprintf("Как проверять «%s»?", target.Name), methodKeyboard("alert-method"))
 	case "target-remove":
-		b.clearPending(userID)
 		if err := b.service.RemoveTarget(ctx, userID, target.Name); err != nil {
 			b.send(ctx, chatID, "Не удалось удалить сервер: "+err.Error())
 			return
@@ -482,20 +566,37 @@ func (b *Bot) sendInline(ctx context.Context, chatID int64, text string, keyboar
 func methodKeyboard(prefix string) [][]InlineButton {
 	return [][]InlineButton{{{Text: "ICMP ping", CallbackData: prefix + ":icmp"}, {Text: "TCP порт", CallbackData: prefix + ":tcp"}}, {{Text: "HTTP/HTTPS", CallbackData: prefix + ":http"}}}
 }
-func (b *Bot) setPending(userID int64, state interaction) {
+
+func (b *Bot) setPending(ctx context.Context, chatID, userID int64, state interaction) bool {
+	if b.store != nil {
+		if err := b.store.SaveInteraction(ctx, userID, state); err != nil {
+			b.logger.Error("persist Telegram dialog state", "user_id", userID, "step", state.Step, "error", err)
+			b.send(ctx, chatID, "Не удалось сохранить состояние формы. Данные не продвинуты, попробуй ещё раз.")
+			return false
+		}
+	}
 	b.pendingMu.Lock()
 	b.pending[userID] = state
 	b.pendingMu.Unlock()
+	return true
 }
 func (b *Bot) getPending(userID int64) interaction {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	return b.pending[userID]
 }
-func (b *Bot) clearPending(userID int64) {
+func (b *Bot) clearPending(ctx context.Context, chatID, userID int64) bool {
+	if b.store != nil {
+		if err := b.store.DeleteInteraction(ctx, userID); err != nil {
+			b.logger.Error("clear persisted Telegram dialog state", "user_id", userID, "error", err)
+			b.send(ctx, chatID, "Не удалось сохранить завершение формы. Текущие данные оставлены, попробуй ещё раз.")
+			return false
+		}
+	}
 	b.pendingMu.Lock()
 	delete(b.pending, userID)
 	b.pendingMu.Unlock()
+	return true
 }
 func (b *Bot) addTarget(ctx context.Context, chatID, userID int64, name, host string) {
 	if err := b.service.AddTarget(ctx, userID, name, host); err != nil {
@@ -532,6 +633,9 @@ func (b *Bot) chooseAlertTarget(ctx context.Context, chatID, userID int64) {
 	targets := b.service.Targets(userID)
 	if len(targets) == 0 {
 		b.send(ctx, chatID, "Сначала добавь сервер кнопкой «Добавить сервер».")
+		return
+	}
+	if !b.setPending(ctx, chatID, userID, interaction{Step: "alert-target"}) {
 		return
 	}
 	keyboard := make([][]InlineButton, 0, len(targets))

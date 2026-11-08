@@ -42,7 +42,7 @@ func TestSQLiteMonitorIntegration(t *testing.T) {
 	if err = svc.AddTarget(ctx, 22, "edge", "2001:db8::5"); err != nil {
 		t.Fatal(err)
 	}
-	alert, err := svc.AddAlert(ctx, 22, 22, "edge", "tcp", "443", time.Minute)
+	alert, err := svc.AddAlertWithID(ctx, "form-request-22", 22, 22, "edge", "tcp", "443", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +70,12 @@ func TestSQLiteMonitorIntegration(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	interaction := domain.Interaction{Step: "add-alert-interval", Name: "edge", Host: "2001:db8::5", Method: "tcp", Argument: "443", RequestID: "form-request-22"}
+	if err = repo.SaveInteraction(ctx, 22, interaction); err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
 	cancel()
 	<-done
 	if err = repo.Close(); err != nil {
@@ -86,5 +92,17 @@ func TestSQLiteMonitorIntegration(t *testing.T) {
 	}
 	if len(state.Targets["22"]) != 1 || len(state.Alerts) != 1 || state.Alerts[0].Target != (domain.Target{Name: "edge", Host: "2001:db8::5"}) || state.Alerts[0].LastUp == nil || !*state.Alerts[0].LastUp || state.Alerts[0].LastCheck.IsZero() {
 		t.Fatalf("persisted state %#v", state)
+	}
+	interactions, err := reopened.LoadInteractions(ctx)
+	if err != nil || interactions[22] != interaction {
+		t.Fatalf("restored dialog state = %+v, err=%v", interactions[22], err)
+	}
+	restoredService, err := monitor.New(ctx, reopened, integrationNetwork{}, integrationBlock{}, integrationNotifier{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, err := restoredService.AddAlertWithID(ctx, "form-request-22", 22, 22, "edge", "tcp", "443", time.Minute)
+	if err != nil || retried.ID != alert.ID || len(restoredService.Alerts(22)) != 1 {
+		t.Fatalf("restored alert retry = %+v; alerts=%+v; err=%v", retried, restoredService.Alerts(22), err)
 	}
 }

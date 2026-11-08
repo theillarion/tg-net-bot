@@ -23,6 +23,60 @@ import (
 
 type botRepo struct{ state domain.State }
 
+type failedAlertInsertRepo struct{ *botRepo }
+
+func (failedAlertInsertRepo) InsertAlert(context.Context, domain.Alert) error {
+	return errors.New("alert database unavailable")
+}
+
+type testInteractionStore struct{ states map[int64]domain.Interaction }
+
+type failedInteractionStore struct{ err error }
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func (s failedInteractionStore) LoadInteractions(context.Context) (map[int64]domain.Interaction, error) {
+	return nil, s.err
+}
+func (s failedInteractionStore) SaveInteraction(context.Context, int64, domain.Interaction) error {
+	return s.err
+}
+func (s failedInteractionStore) DeleteInteraction(context.Context, int64) error { return s.err }
+
+func (s *testInteractionStore) LoadInteractions(context.Context) (map[int64]domain.Interaction, error) {
+	loaded := make(map[int64]domain.Interaction, len(s.states))
+	for userID, state := range s.states {
+		loaded[userID] = state
+	}
+	return loaded, nil
+}
+func (s *testInteractionStore) SaveInteraction(_ context.Context, userID int64, state domain.Interaction) error {
+	if s.states == nil {
+		s.states = make(map[int64]domain.Interaction)
+	}
+	s.states[userID] = state
+	return nil
+}
+func (s *testInteractionStore) DeleteInteraction(_ context.Context, userID int64) error {
+	delete(s.states, userID)
+	return nil
+}
+
 func (r *botRepo) Load(context.Context) (domain.State, error) { return r.state, nil }
 func (r *botRepo) InsertTarget(_ context.Context, u int64, v domain.Target) error {
 	r.state.Targets[fmtUser(u)] = append(r.state.Targets[fmtUser(u)], v)
@@ -80,6 +134,8 @@ func cb(data string) CallbackQuery {
 func TestBotMessagesAndButtons(t *testing.T) {
 	b, _, _ := setupBot(t)
 	ctx := context.Background()
+	store := &testInteractionStore{states: make(map[int64]domain.Interaction)}
+	b.store = store
 	b.handleMessage(ctx, msg("/start"))
 	b.handleMessage(ctx, msg("/help"))
 	b.handleMessage(ctx, msg("/help@netbot"))
@@ -103,6 +159,9 @@ func TestBotMessagesAndButtons(t *testing.T) {
 	b.handleMessage(ctx, msg("prod"))
 	b.handleCallback(ctx, cb("check-method:tcp"))
 	b.handleMessage(ctx, msg("99999"))
+	if got := b.getPending(1); got.Step != "manual-tcp-port" || store.states[1] != got {
+		t.Fatalf("invalid port discarded persisted form state: memory=%+v stored=%+v", got, store.states[1])
+	}
 	b.handleMessage(ctx, msg("443"))
 	b.handleCallback(ctx, cb("check-method:http"))
 	b.handleCallback(ctx, cb("manual-http:https"))
@@ -136,7 +195,23 @@ func TestBotMessagesAndButtons(t *testing.T) {
 	b.handleCallback(ctx, cb("target-block:0"))
 	b.handleCallback(ctx, cb("target-alert:0"))
 	b.handleCallback(ctx, cb("alert-method:icmp"))
+	alertDraft := b.getPending(1)
+	if alertDraft.Step != "add-alert-interval" || alertDraft.RequestID == "" {
+		t.Fatalf("alert draft was not persisted at interval step: %+v", alertDraft)
+	}
+	b.handleCallback(ctx, cb("alert-target:0")) // Repeated click from the old server picker.
+	if got := b.getPending(1); got != alertDraft {
+		t.Fatalf("stale alert-target callback changed current draft: got=%+v want=%+v", got, alertDraft)
+	}
+	b.handleCallback(ctx, cb("alert-method:tcp")) // Repeated click from the old method picker.
+	if got := b.getPending(1); got != alertDraft {
+		t.Fatalf("stale alert-method callback changed current draft: got=%+v want=%+v", got, alertDraft)
+	}
 	b.handleMessage(ctx, msg("1m"))
+	b.handleCallback(ctx, cb("target-alert:0"))
+	b.handleCallback(ctx, cb("alert-method:http"))
+	b.handleCallback(ctx, cb("alert-http:https"))
+	b.handleMessage(ctx, msg("2m"))
 	b.handleMessage(ctx, msg(buttonRules))
 	b.handleMessage(ctx, msg("/alert prod http 30s https"))
 	b.handleMessage(ctx, msg("/alerts"))
@@ -183,7 +258,7 @@ func TestBotPendingEdgeCasesAndEmptyLists(t *testing.T) {
 func TestManualCheckRejectsStaleMethodButton(t *testing.T) {
 	b, _, _ := setupBot(t)
 	ctx := context.Background()
-	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.setPending(ctx, 10, 1, interaction{Step: "check-method", Host: "example.com"})
 	b.selectManualMethod(ctx, 10, 1, "icmp")
 	if got := b.getPending(1); got.Step != "" {
 		t.Fatalf("ICMP selection did not consume interaction: %+v", got)
@@ -196,12 +271,12 @@ func TestManualCheckRejectsStaleMethodButton(t *testing.T) {
 	if got := b.getPending(1); got.Step != "" {
 		t.Fatalf("stale HTTP button created pending interaction: %+v", got)
 	}
-	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.setPending(ctx, 10, 1, interaction{Step: "check-method", Host: "example.com"})
 	b.handleCallback(ctx, cb("check-method:tcp"))
 	if got := b.getPending(1); got.Step != "manual-tcp-port" || got.Host != "example.com" {
 		t.Fatalf("valid TCP selection lost its host: %+v", got)
 	}
-	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.setPending(ctx, 10, 1, interaction{Step: "check-method", Host: "example.com"})
 	b.handleCallback(ctx, cb("check-method:http"))
 	if got := b.getPending(1); got.Step != "manual-http" || got.Host != "example.com" {
 		t.Fatalf("valid HTTP selection lost its host: %+v", got)
@@ -210,12 +285,262 @@ func TestManualCheckRejectsStaleMethodButton(t *testing.T) {
 	if got := b.getPending(1); got.Step != "" {
 		t.Fatalf("HTTPS selection did not consume interaction: %+v", got)
 	}
-	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.setPending(ctx, 10, 1, interaction{Step: "check-method", Host: "example.com"})
 	b.selectManualMethod(ctx, 10, 1, "unsupported")
-	b.setPending(1, interaction{Step: "check-method"})
+	b.setPending(ctx, 10, 1, interaction{Step: "check-method"})
 	b.selectManualMethod(ctx, 10, 1, "tcp")
 	if got := b.getPending(1); got.Step != "check-method" {
 		t.Fatalf("invalid host interaction was accepted: %+v", got)
+	}
+}
+
+func TestBotRestoresAndRetainsFormState(t *testing.T) {
+	base, _, _ := setupBot(t)
+	state := domain.Interaction{Step: "manual-tcp-port", Host: "illarion.tech", Method: "tcp"}
+	store := &testInteractionStore{states: map[int64]domain.Interaction{1: state}}
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := bot.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want cancellation", err)
+	}
+	if got := bot.getPending(1); got != state {
+		t.Fatalf("restored state = %+v, want %+v", got, state)
+	}
+	bot.handleMessage(context.Background(), msg("70000"))
+	if got := bot.getPending(1); got != state || store.states[1] != state {
+		t.Fatalf("invalid input lost state: memory=%+v persisted=%+v", got, store.states[1])
+	}
+	bot.handleMessage(context.Background(), msg("443"))
+	if got := bot.getPending(1); got.Step != "" {
+		t.Fatalf("valid input did not finish form: %+v", got)
+	}
+	if _, ok := store.states[1]; ok {
+		t.Fatalf("completed form remains persisted: %+v", store.states[1])
+	}
+}
+
+func TestRepeatedAddHostSubmissionAfterRestartIsIdempotent(t *testing.T) {
+	base, _, _ := setupBot(t)
+	ctx := context.Background()
+	if err := base.service.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	state := domain.Interaction{Step: "add-host", Name: "edge"}
+	store := &testInteractionStore{states: map[int64]domain.Interaction{1: state}}
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, store)
+	loadCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := bot.Run(loadCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want cancellation", err)
+	}
+	bot.handleMessage(ctx, msg("example.com"))
+	if targets := base.service.Targets(1); len(targets) != 1 {
+		t.Fatalf("duplicate input created %d targets, want 1", len(targets))
+	}
+	if _, ok := store.states[1]; ok {
+		t.Fatalf("completed replay left dialog state: %+v", store.states[1])
+	}
+	if err := base.service.AddTarget(ctx, 1, "used", "old.example"); err != nil {
+		t.Fatal(err)
+	}
+	if !bot.setPending(ctx, 10, 1, interaction{Step: "add-host", Name: "used"}) {
+		t.Fatal("could not seed duplicate-name form")
+	}
+	bot.handleMessage(ctx, msg("new.example"))
+	if got := bot.getPending(1); got.Step != "add-name" {
+		t.Fatalf("duplicate name did not return to name entry: %+v", got)
+	}
+}
+
+func TestAlertCreationRetryAfterRestartIsIdempotent(t *testing.T) {
+	base, _, _ := setupBot(t)
+	ctx := context.Background()
+	if err := base.service.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	state := interaction{Step: "add-alert-interval", Name: "edge", Host: "example.com", Method: "tcp", Argument: "443", RequestID: "form-request-42"}
+	// Simulate a crash after the alert insert committed but before the form was cleared.
+	if _, err := base.service.AddAlertWithID(ctx, state.RequestID, 10, 1, state.Name, state.Method, state.Argument, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	store := &testInteractionStore{states: map[int64]domain.Interaction{1: state}}
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, store)
+	loadCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := bot.Run(loadCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want cancellation", err)
+	}
+	bot.handleMessage(ctx, msg("1m"))
+	if alerts := base.service.Alerts(1); len(alerts) != 1 || alerts[0].ID != state.RequestID {
+		t.Fatalf("retry created duplicate alert: %+v", alerts)
+	}
+	if _, ok := store.states[1]; ok {
+		t.Fatalf("completed retry left dialog state: %+v", store.states[1])
+	}
+}
+
+func TestLegacyAlertFormReceivesPersistedRequestIDBeforeCreate(t *testing.T) {
+	base, _, _ := setupBot(t)
+	ctx := context.Background()
+	if err := base.service.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	store := &testInteractionStore{states: map[int64]domain.Interaction{}}
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, store)
+	bot.createAlert(ctx, 10, 1, interaction{Step: "add-alert-interval", Name: "edge", Method: "tcp", Argument: "443"}, time.Minute)
+	alerts := base.service.Alerts(1)
+	if len(alerts) != 1 || alerts[0].ID == "" {
+		t.Fatalf("alert created without a request ID: %+v", alerts)
+	}
+	if _, ok := store.states[1]; ok {
+		t.Fatalf("completed legacy form remains persisted: %+v", store.states[1])
+	}
+}
+
+func TestAlertFormRemainsAfterAlertStorageFailure(t *testing.T) {
+	ctx := context.Background()
+	state := domain.EmptyState()
+	repo := &failedAlertInsertRepo{botRepo: &botRepo{state: state}}
+	api := &API{token: "test", client: &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":true}`))}, nil
+	})}, baseURL: "http://test"}
+	service, err := monitor.New(ctx, repo, botNetwork{}, botBlock{}, api, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = service.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	draft := interaction{Step: "add-alert-interval", Name: "edge", Host: "example.com", Method: "tcp", Argument: "443", RequestID: "form-stable-id"}
+	store := &testInteractionStore{states: map[int64]domain.Interaction{1: draft}}
+	bot := NewBot(api, service, map[int64]struct{}{1: {}}, slog.New(slog.NewTextHandler(io.Discard, nil)), store)
+	bot.pending[1] = draft
+	bot.handlePending(ctx, 10, 1, draft, "5m")
+	if got := bot.getPending(1); got != draft || store.states[1] != draft {
+		t.Fatalf("storage error discarded alert form: memory=%+v persisted=%+v", got, store.states[1])
+	}
+	if len(service.Alerts(1)) != 0 {
+		t.Fatalf("failed alert insert changed state: %+v", service.Alerts(1))
+	}
+}
+
+func TestBotKeepsPreviousStateWhenPersistenceFails(t *testing.T) {
+	base, _, _ := setupBot(t)
+	want := interaction{Step: "add-name", Name: "preserve-me"}
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, failedInteractionStore{err: errors.New("disk full")})
+	bot.pending[1] = want
+	if bot.setPending(context.Background(), 10, 1, interaction{Step: "add-host", Name: "new"}) {
+		t.Fatal("setPending succeeded with failed storage")
+	}
+	if got := bot.getPending(1); got != want {
+		t.Fatalf("failed save replaced previous state: %+v", got)
+	}
+	if bot.clearPending(context.Background(), 10, 1) {
+		t.Fatal("clearPending succeeded with failed storage")
+	}
+	if got := bot.getPending(1); got != want {
+		t.Fatalf("failed clear discarded previous state: %+v", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := bot.Run(ctx); err == nil || !strings.Contains(err.Error(), "restore Telegram dialog state") {
+		t.Fatalf("Run error after restore failure = %v", err)
+	}
+}
+
+func TestPersistenceFailureIsReportedBeforeFormAdvances(t *testing.T) {
+	base, _, _ := setupBot(t)
+	var messages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		messages = append(messages, payload.Text)
+		io.WriteString(w, `{"ok":true,"result":true}`)
+	}))
+	defer server.Close()
+	api := &API{token: "test", client: server.Client(), baseURL: server.URL}
+	bot := NewBot(api, base.service, map[int64]struct{}{1: {}}, base.logger, failedInteractionStore{err: errors.New("database unavailable")})
+	bot.handleMessage(context.Background(), msg(buttonCheck))
+	if got := bot.getPending(1); got.Step != "" {
+		t.Fatalf("form advanced after failed persistence: %+v", got)
+	}
+	if len(messages) != 1 || !strings.Contains(messages[0], "Не удалось сохранить состояние формы") {
+		t.Fatalf("persistence failure message = %q", messages)
+	}
+}
+
+func TestFormTransitionsDoNotAdvanceWhenPersistenceFails(t *testing.T) {
+	base, _, _ := setupBot(t)
+	ctx := context.Background()
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, failedInteractionStore{err: errors.New("database unavailable")})
+	for _, button := range []string{buttonCheck, buttonBlock, buttonAdd} {
+		bot.handleMessage(ctx, msg(button))
+		if got := bot.getPending(1); got.Step != "" {
+			t.Fatalf("button %q advanced without persistence: %+v", button, got)
+		}
+	}
+	bot.handlePending(ctx, 10, 1, interaction{Step: "check-target"}, "example.com")
+	bot.pending[1] = interaction{Step: "check-method", Host: "example.com"}
+	bot.selectManualMethod(ctx, 10, 1, "tcp")
+	if got := bot.getPending(1); got.Step != "check-method" {
+		t.Fatalf("TCP form advanced without persistence: %+v", got)
+	}
+	bot.selectManualMethod(ctx, 10, 1, "http")
+	if got := bot.getPending(1); got.Step != "check-method" {
+		t.Fatalf("HTTP form advanced without persistence: %+v", got)
+	}
+	if err := base.service.AddTarget(ctx, 1, "edge", "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	bot.chooseAlertTarget(ctx, 10, 1)
+	bot.selectAlertTarget(ctx, 10, 1, "0")
+	bot.pending[1] = interaction{Step: "alert-method", Name: "edge", Host: "example.com"}
+	for _, method := range []string{"icmp", "tcp", "http"} {
+		bot.selectAlertMethod(ctx, 10, 1, method)
+		if got := bot.getPending(1); got.Step != "alert-method" {
+			t.Fatalf("alert method %q advanced without persistence: %+v", method, got)
+		}
+	}
+	bot.handleTargetAction(ctx, 10, 1, "target-check", "0")
+	if got := bot.getPending(1); got.Step != "alert-method" {
+		t.Fatalf("target check advanced without persistence: %+v", got)
+	}
+	bot.handleTargetAction(ctx, 10, 1, "target-alert", "0")
+	if got := bot.getPending(1); got.Step != "alert-method" {
+		t.Fatalf("target alert advanced without persistence: %+v", got)
+	}
+	bot.createAlert(ctx, 10, 1, interaction{Step: "add-alert-interval", Name: "edge", Method: "icmp"}, time.Minute)
+	if len(base.service.Alerts(1)) != 0 {
+		t.Fatalf("alert was created without persisting its request ID: %+v", base.service.Alerts(1))
+	}
+}
+
+func TestCompletedFormStateIsRetainedWhenClearFails(t *testing.T) {
+	base, _, _ := setupBot(t)
+	ctx := context.Background()
+	bot := NewBot(base.api, base.service, map[int64]struct{}{1: {}}, base.logger, failedInteractionStore{err: errors.New("database unavailable")})
+	bot.pending[1] = interaction{Step: "add-host", Name: "edge"}
+	bot.handlePending(ctx, 10, 1, bot.getPending(1), "example.com")
+	if _, ok := base.service.FindTarget(1, "edge"); !ok {
+		t.Fatal("server was not created")
+	}
+	if got := bot.getPending(1); got.Step != "add-host" {
+		t.Fatalf("failed form clear discarded add-host state: %+v", got)
+	}
+	bot.pending[1] = interaction{Step: "block-target"}
+	bot.handlePending(ctx, 10, 1, bot.getPending(1), "edge")
+	if got := bot.getPending(1); got.Step != "block-target" {
+		t.Fatalf("failed form clear discarded block state: %+v", got)
+	}
+	bot.pending[1] = interaction{Step: "add-alert-interval", Name: "edge", Method: "icmp", RequestID: "stable-request"}
+	bot.handlePending(ctx, 10, 1, bot.getPending(1), "1m")
+	if got := bot.getPending(1); got.Step != "add-alert-interval" {
+		t.Fatalf("failed form clear discarded alert state: %+v", got)
 	}
 }
 
@@ -245,7 +570,7 @@ func TestBotHelpersAndRunCancellation(t *testing.T) {
 
 func TestBotRunPollingAndFailure(t *testing.T) {
 	var mu sync.Mutex
-	var logs bytes.Buffer
+	var logs synchronizedBuffer
 	messages := 0
 	var cancel context.CancelFunc
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -351,6 +676,12 @@ func TestBotPrimaryUserJourney(t *testing.T) {
 	bot := NewBot(api, service, map[int64]struct{}{1: {}}, nil)
 	bot.handleMessage(ctx, msg("/start"))
 	bot.handleMessage(ctx, msg("/add edge 2001:db8::7"))
+	bot.handleCallback(ctx, cb("target-block:0"))
+	bot.handleMessage(ctx, msg("/add remove-me remove.example"))
+	bot.handleCallback(ctx, cb("target-remove:1"))
+	if _, ok := service.FindTarget(1, "remove-me"); ok {
+		t.Fatal("target-remove callback left the server")
+	}
 	if target, ok := service.FindTarget(1, "edge"); !ok || target.Host != "2001:db8::7" {
 		t.Fatalf("saved target = %#v, found=%v", target, ok)
 	}

@@ -22,13 +22,14 @@ func Serve(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 type appState interface {
 	monitor.Repository
+	telegram.InteractionStore
 	Close() error
 }
 
-type botRunner func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger) error
+type botRunner func(context.Context, *telegram.API, *monitor.Service, map[int64]struct{}, *slog.Logger, telegram.InteractionStore) error
 
-func runTelegramBot(ctx context.Context, api *telegram.API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger) error {
-	return telegram.NewBot(api, service, allowed, logger).Run(ctx)
+func runTelegramBot(ctx context.Context, api *telegram.API, service *monitor.Service, allowed map[int64]struct{}, logger *slog.Logger, store telegram.InteractionStore) error {
+	return telegram.NewBot(api, service, allowed, logger, store).Run(ctx)
 }
 
 func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open func(context.Context, string) (appState, error), newAPI func(string, string) (*telegram.API, error), runBot botRunner) error {
@@ -55,7 +56,7 @@ func serve(ctx context.Context, cfg config.Config, logger *slog.Logger, open fun
 		logger.Info("application started", "database_path", cfg.DatabasePath)
 	}
 	go service.Run(ctx)
-	if err = runBot(ctx, api, service, cfg.AllowedUsers, logger); err != nil && !errors.Is(err, context.Canceled) {
+	if err = runBot(ctx, api, service, cfg.AllowedUsers, logger, state); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("run Telegram bot: %w", err)
 	}
 	return nil
