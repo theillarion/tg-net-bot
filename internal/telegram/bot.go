@@ -330,6 +330,10 @@ func (b *Bot) handleCallback(ctx context.Context, callback CallbackQuery) {
 		b.selectManualMethod(ctx, chatID, callback.From.ID, parts[1])
 	case "manual-http":
 		pending := b.getPending(callback.From.ID)
+		if pending.Step != "manual-http" || !checker.ValidHost(pending.Host) {
+			b.send(ctx, chatID, "Это меню проверки уже устарело. Начни проверку заново кнопкой «Проверить доступность».")
+			return
+		}
 		b.clearPending(callback.From.ID)
 		b.runManualCheck(ctx, chatID, pending.Host, "http", parts[1])
 	case "alert-target":
@@ -354,6 +358,10 @@ func (b *Bot) handleCallback(ctx context.Context, callback CallbackQuery) {
 
 func (b *Bot) selectManualMethod(ctx context.Context, chatID, userID int64, method string) {
 	pending := b.getPending(userID)
+	if pending.Step != "check-method" || !checker.ValidHost(pending.Host) {
+		b.send(ctx, chatID, "Это меню проверки уже устарело. Начни проверку заново кнопкой «Проверить доступность».")
+		return
+	}
 	switch method {
 	case "icmp":
 		b.clearPending(userID)
@@ -363,7 +371,11 @@ func (b *Bot) selectManualMethod(ctx context.Context, chatID, userID int64, meth
 		b.setPending(userID, pending)
 		b.send(ctx, chatID, "Какой TCP-порт проверить? Отправь номер, например 443.")
 	case "http":
+		pending.Step = "manual-http"
+		b.setPending(userID, pending)
 		b.sendInline(ctx, chatID, "Проверить HTTPS или HTTP?", [][]InlineButton{{{Text: "HTTPS", CallbackData: "manual-http:https"}, {Text: "HTTP", CallbackData: "manual-http:http"}}})
+	default:
+		b.send(ctx, chatID, "Неизвестный способ проверки. Начни проверку заново.")
 	}
 }
 

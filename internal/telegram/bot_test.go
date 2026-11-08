@@ -180,6 +180,45 @@ func TestBotPendingEdgeCasesAndEmptyLists(t *testing.T) {
 	b.handleMessage(ctx, msg("broken"))
 	b.handleMessage(ctx, msg("bad/path"))
 }
+func TestManualCheckRejectsStaleMethodButton(t *testing.T) {
+	b, _, _ := setupBot(t)
+	ctx := context.Background()
+	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.selectManualMethod(ctx, 10, 1, "icmp")
+	if got := b.getPending(1); got.Step != "" {
+		t.Fatalf("ICMP selection did not consume interaction: %+v", got)
+	}
+	b.handleCallback(ctx, cb("check-method:tcp"))
+	if got := b.getPending(1); got.Step != "" {
+		t.Fatalf("stale TCP button created pending interaction: %+v", got)
+	}
+	b.handleCallback(ctx, cb("manual-http:https"))
+	if got := b.getPending(1); got.Step != "" {
+		t.Fatalf("stale HTTP button created pending interaction: %+v", got)
+	}
+	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.handleCallback(ctx, cb("check-method:tcp"))
+	if got := b.getPending(1); got.Step != "manual-tcp-port" || got.Host != "example.com" {
+		t.Fatalf("valid TCP selection lost its host: %+v", got)
+	}
+	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.handleCallback(ctx, cb("check-method:http"))
+	if got := b.getPending(1); got.Step != "manual-http" || got.Host != "example.com" {
+		t.Fatalf("valid HTTP selection lost its host: %+v", got)
+	}
+	b.handleCallback(ctx, cb("manual-http:https"))
+	if got := b.getPending(1); got.Step != "" {
+		t.Fatalf("HTTPS selection did not consume interaction: %+v", got)
+	}
+	b.setPending(1, interaction{Step: "check-method", Host: "example.com"})
+	b.selectManualMethod(ctx, 10, 1, "unsupported")
+	b.setPending(1, interaction{Step: "check-method"})
+	b.selectManualMethod(ctx, 10, 1, "tcp")
+	if got := b.getPending(1); got.Step != "check-method" {
+		t.Fatalf("invalid host interaction was accepted: %+v", got)
+	}
+}
+
 func TestBotHelpersAndRunCancellation(t *testing.T) {
 	b, _, _ := setupBot(t)
 	if got := at([]string{"a"}, 3); got != "" {
